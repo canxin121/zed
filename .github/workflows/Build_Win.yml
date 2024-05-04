@@ -1,0 +1,24 @@
+name: "BUILD"
+on:
+  workflow_dispatch:
+
+jobs:
+  build_on_windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: git modules
+        run: git submodule update --init --recursive
+        
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        
+      - name: Build Release
+        run: cargo build --release
+        
+      - name: Upload files
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppRhyme-release-amd64
+          path: target/release/Zed.exe

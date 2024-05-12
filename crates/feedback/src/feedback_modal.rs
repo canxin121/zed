@@ -10,13 +10,14 @@ use gpui::{
     div, rems, AppContext, DismissEvent, EventEmitter, FocusHandle, FocusableView, Model,
     PromptLevel, Render, Task, View, ViewContext,
 };
+use http::HttpClient;
 use isahc::Request;
 use language::Buffer;
 use project::Project;
 use regex::Regex;
 use serde_derive::Serialize;
 use ui::{prelude::*, Button, ButtonStyle, IconPosition, Tooltip};
-use util::{http::HttpClient, ResultExt};
+use util::ResultExt;
 use workspace::notifications::NotificationId;
 use workspace::{DismissDecision, ModalView, Toast, Workspace};
 
@@ -454,7 +455,7 @@ impl Render for FeedbackModal {
                     .flex_1()
                     .bg(cx.theme().colors().editor_background)
                     .p_2()
-                    .border()
+                    .border_1()
                     .rounded_md()
                     .border_color(cx.theme().colors().border)
                     .child(self.feedback_editor.clone()),
@@ -466,7 +467,7 @@ impl Render for FeedbackModal {
                         h_flex()
                             .bg(cx.theme().colors().editor_background)
                             .p_2()
-                            .border()
+                            .border_1()
                             .rounded_md()
                             .border_color(if self.valid_email_address() {
                                 cx.theme().colors().border

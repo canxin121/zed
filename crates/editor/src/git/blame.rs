@@ -4,18 +4,16 @@ use anyhow::Result;
 use collections::HashMap;
 use git::{
     blame::{Blame, BlameEntry},
-    hosting_provider::HostingProvider,
-    permalink::{build_commit_permalink, parse_git_remote_url},
-    pull_request::{extract_pull_request, PullRequest},
-    Oid,
+    parse_git_remote_url, GitHostingProvider, GitHostingProviderRegistry, Oid, PullRequest,
 };
 use gpui::{Model, ModelContext, Subscription, Task};
+use http::HttpClient;
 use language::{markdown, Bias, Buffer, BufferSnapshot, Edit, LanguageRegistry, ParsedMarkdown};
+use multi_buffer::MultiBufferRow;
 use project::{Item, Project};
 use smallvec::SmallVec;
 use sum_tree::SumTree;
 use url::Url;
-use util::http::HttpClient;
 
 #[derive(Clone, Debug, Default)]
 pub struct GitBlameEntry {
@@ -50,11 +48,21 @@ impl<'a> sum_tree::Dimension<'a, GitBlameEntrySummary> for u32 {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GitRemote {
-    pub host: HostingProvider,
+    pub host: Arc<dyn GitHostingProvider + Send + Sync + 'static>,
     pub owner: String,
     pub repo: String,
+}
+
+impl std::fmt::Debug for GitRemote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitRemote")
+            .field("host", &self.host.name())
+            .field("owner", &self.owner)
+            .field("repo", &self.repo)
+            .finish()
+    }
 }
 
 impl GitRemote {
@@ -178,7 +186,7 @@ impl GitBlame {
 
     pub fn blame_for_rows<'a>(
         &'a mut self,
-        rows: impl 'a + IntoIterator<Item = Option<u32>>,
+        rows: impl 'a + IntoIterator<Item = Option<MultiBufferRow>>,
         cx: &mut ModelContext<Self>,
     ) -> impl 'a + Iterator<Item = Option<BlameEntry>> {
         self.sync(cx);
@@ -186,7 +194,7 @@ impl GitBlame {
         let mut cursor = self.entries.cursor::<u32>();
         rows.into_iter().map(move |row| {
             let row = row?;
-            cursor.seek_forward(&row, Bias::Right, &());
+            cursor.seek_forward(&row.0, Bias::Right, &());
             cursor.item()?.blame.clone()
         })
     }
@@ -323,6 +331,7 @@ impl GitBlame {
         let snapshot = self.buffer.read(cx).snapshot();
         let blame = self.project.read(cx).blame_buffer(&self.buffer, None, cx);
         let languages = self.project.read(cx).languages().clone();
+        let provider_registry = GitHostingProviderRegistry::default_global(cx);
 
         self.task = cx.spawn(|this, mut cx| async move {
             let result = cx
@@ -338,9 +347,14 @@ impl GitBlame {
                         } = blame.await?;
 
                         let entries = build_blame_entry_sum_tree(entries, snapshot.max_point().row);
-                        let commit_details =
-                            parse_commit_messages(messages, remote_url, &permalinks, &languages)
-                                .await;
+                        let commit_details = parse_commit_messages(
+                            messages,
+                            remote_url,
+                            &permalinks,
+                            provider_registry,
+                            &languages,
+                        )
+                        .await;
 
                         anyhow::Ok((entries, commit_details))
                     }
@@ -431,19 +445,22 @@ async fn parse_commit_messages(
     messages: impl IntoIterator<Item = (Oid, String)>,
     remote_url: Option<String>,
     deprecated_permalinks: &HashMap<Oid, Url>,
+    provider_registry: Arc<GitHostingProviderRegistry>,
     languages: &Arc<LanguageRegistry>,
 ) -> HashMap<Oid, CommitDetails> {
     let mut commit_details = HashMap::default();
 
-    let parsed_remote_url = remote_url.as_deref().and_then(parse_git_remote_url);
+    let parsed_remote_url = remote_url
+        .as_deref()
+        .and_then(|remote_url| parse_git_remote_url(provider_registry, remote_url));
 
     for (oid, message) in messages {
         let parsed_message = parse_markdown(&message, &languages).await;
 
-        let permalink = if let Some(git_remote) = parsed_remote_url.as_ref() {
-            Some(build_commit_permalink(
-                git::permalink::BuildCommitPermalinkParams {
-                    remote: git_remote,
+        let permalink = if let Some((provider, git_remote)) = parsed_remote_url.as_ref() {
+            Some(provider.build_commit_permalink(
+                git_remote,
+                git::BuildCommitPermalinkParams {
                     sha: oid.to_string().as_str(),
                 },
             ))
@@ -455,15 +472,17 @@ async fn parse_commit_messages(
             deprecated_permalinks.get(&oid).cloned()
         };
 
-        let remote = parsed_remote_url.as_ref().map(|remote| GitRemote {
-            host: remote.provider.clone(),
-            owner: remote.owner.to_string(),
-            repo: remote.repo.to_string(),
-        });
+        let remote = parsed_remote_url
+            .as_ref()
+            .map(|(provider, remote)| GitRemote {
+                host: provider.clone(),
+                owner: remote.owner.to_string(),
+                repo: remote.repo.to_string(),
+            });
 
         let pull_request = parsed_remote_url
             .as_ref()
-            .and_then(|remote| extract_pull_request(remote, &message));
+            .and_then(|(provider, remote)| provider.extract_pull_request(remote, &message));
 
         commit_details.insert(
             oid,
@@ -514,7 +533,7 @@ mod tests {
         ($blame:expr, $rows:expr, $expected:expr, $cx:expr) => {
             assert_eq!(
                 $blame
-                    .blame_for_rows($rows.map(Some), $cx)
+                    .blame_for_rows($rows.map(MultiBufferRow).map(Some), $cx)
                     .collect::<Vec<_>>(),
                 $expected
             );
@@ -579,7 +598,7 @@ mod tests {
         blame.update(cx, |blame, cx| {
             assert_eq!(
                 blame
-                    .blame_for_rows((0..1).map(Some), cx)
+                    .blame_for_rows((0..1).map(MultiBufferRow).map(Some), cx)
                     .collect::<Vec<_>>(),
                 vec![None]
             );
@@ -643,7 +662,7 @@ mod tests {
             // All lines
             assert_eq!(
                 blame
-                    .blame_for_rows((0..8).map(Some), cx)
+                    .blame_for_rows((0..8).map(MultiBufferRow).map(Some), cx)
                     .collect::<Vec<_>>(),
                 vec![
                     Some(blame_entry("1b1b1b", 0..1)),
@@ -659,7 +678,7 @@ mod tests {
             // Subset of lines
             assert_eq!(
                 blame
-                    .blame_for_rows((1..4).map(Some), cx)
+                    .blame_for_rows((1..4).map(MultiBufferRow).map(Some), cx)
                     .collect::<Vec<_>>(),
                 vec![
                     Some(blame_entry("0d0d0d", 1..2)),
@@ -670,7 +689,7 @@ mod tests {
             // Subset of lines, with some not displayed
             assert_eq!(
                 blame
-                    .blame_for_rows(vec![Some(1), None, None], cx)
+                    .blame_for_rows(vec![Some(MultiBufferRow(1)), None, None], cx)
                     .collect::<Vec<_>>(),
                 vec![Some(blame_entry("0d0d0d", 1..2)), None, None]
             );

@@ -9,13 +9,15 @@ use crate::{
     hover_popover::{
         self, hover_at, HOVER_POPOVER_GAP, MIN_POPOVER_CHARACTER_WIDTH, MIN_POPOVER_LINE_HEIGHT,
     },
+    hunk_status,
     items::BufferSearchHighlights,
     mouse_context_menu::{self, MouseContextMenu},
     scroll::scroll_amount::ScrollAmount,
-    CursorShape, DisplayPoint, DocumentHighlightRead, DocumentHighlightWrite, Editor, EditorMode,
-    EditorSettings, EditorSnapshot, EditorStyle, ExpandExcerpts, GutterDimensions, HalfPageDown,
-    HalfPageUp, HoveredCursor, HunkToExpand, LineDown, LineUp, OpenExcerpts, PageDown, PageUp,
-    Point, SelectPhase, Selection, SoftWrap, ToPoint, CURSORS_VISIBLE_FOR, MAX_LINE_LEN,
+    CodeActionsMenu, CursorShape, DisplayPoint, DisplayRow, DocumentHighlightRead,
+    DocumentHighlightWrite, Editor, EditorMode, EditorSettings, EditorSnapshot, EditorStyle,
+    ExpandExcerpts, GutterDimensions, HalfPageDown, HalfPageUp, HoveredCursor, HunkToExpand,
+    LineDown, LineUp, OpenExcerpts, PageDown, PageUp, Point, RowExt, RowRangeExt, SelectPhase,
+    Selection, SoftWrap, ToPoint, CURSORS_VISIBLE_FOR, MAX_LINE_LEN,
 };
 use anyhow::Result;
 use client::ParticipantIndex;
@@ -34,7 +36,7 @@ use gpui::{
 use itertools::Itertools;
 use language::language_settings::ShowWhitespaceSetting;
 use lsp::DiagnosticSeverity;
-use multi_buffer::Anchor;
+use multi_buffer::{Anchor, MultiBufferPoint, MultiBufferRow};
 use project::{
     project_settings::{GitGutterSetting, ProjectSettings},
     ProjectPath,
@@ -63,7 +65,7 @@ struct SelectionLayout {
     is_newest: bool,
     is_local: bool,
     range: Range<DisplayPoint>,
-    active_rows: Range<u32>,
+    active_rows: Range<DisplayRow>,
     user_name: Option<SharedString>,
 }
 
@@ -97,16 +99,19 @@ impl SelectionLayout {
         {
             if head.column() > 0 {
                 head = map.clip_point(DisplayPoint::new(head.row(), head.column() - 1), Bias::Left)
-            } else if head.row() > 0 && head != map.max_point() {
+            } else if head.row().0 > 0 && head != map.max_point() {
                 head = map.clip_point(
-                    DisplayPoint::new(head.row() - 1, map.line_len(head.row() - 1)),
+                    DisplayPoint::new(
+                        head.row().previous_row(),
+                        map.line_len(head.row().previous_row()),
+                    ),
                     Bias::Left,
                 );
                 // updating range.end is a no-op unless you're cursor is
                 // on the newline containing a multi-buffer divider
                 // in which case the clip_point may have moved the head up
                 // an additional row.
-                range.end = DisplayPoint::new(head.row() + 1, 0);
+                range.end = DisplayPoint::new(head.row().next_row(), 0);
                 active_rows.end = head.row();
             }
         }
@@ -127,6 +132,8 @@ pub struct EditorElement {
     editor: View<Editor>,
     style: EditorStyle,
 }
+
+type DisplayRowDelta = u32;
 
 impl EditorElement {
     pub fn new(editor: &View<Editor>, style: EditorStyle) -> Self {
@@ -637,7 +644,11 @@ impl EditorElement {
             editor.update_hovered_link(point_for_position, &position_map.snapshot, modifiers, cx);
 
             if let Some(point) = point_for_position.as_valid() {
-                hover_at(editor, Some(point), cx);
+                let anchor = position_map
+                    .snapshot
+                    .buffer_snapshot
+                    .anchor_before(point.to_offset(&position_map.snapshot, Bias::Left));
+                hover_at(editor, Some(anchor), cx);
                 Self::update_visible_cursor(editor, point, position_map, cx);
             } else {
                 hover_at(editor, None, cx);
@@ -701,12 +712,12 @@ impl EditorElement {
         start_anchor: Anchor,
         end_anchor: Anchor,
         snapshot: &EditorSnapshot,
-        start_row: u32,
-        end_row: u32,
+        start_row: DisplayRow,
+        end_row: DisplayRow,
         cx: &mut WindowContext,
     ) -> (
         Vec<(PlayerColor, Vec<SelectionLayout>)>,
-        BTreeMap<u32, bool>,
+        BTreeMap<DisplayRow, bool>,
         Option<DisplayPoint>,
     ) {
         let mut selections: Vec<(PlayerColor, Vec<SelectionLayout>)> = Vec::new();
@@ -738,10 +749,11 @@ impl EditorElement {
                     newest_selection_head = Some(layout.head);
                 }
 
-                for row in cmp::max(layout.active_rows.start, start_row)
-                    ..=cmp::min(layout.active_rows.end, end_row)
+                for row in cmp::max(layout.active_rows.start.0, start_row.0)
+                    ..=cmp::min(layout.active_rows.end.0, end_row.0)
                 {
-                    let contains_non_empty_selection = active_rows.entry(row).or_insert(!is_empty);
+                    let contains_non_empty_selection =
+                        active_rows.entry(DisplayRow(row)).or_insert(!is_empty);
                     *contains_non_empty_selection |= !is_empty;
                 }
                 layouts.push(layout);
@@ -821,7 +833,7 @@ impl EditorElement {
         snapshot: &EditorSnapshot,
         content_origin: gpui::Point<Pixels>,
         visible_anchor_range: Range<Anchor>,
-        visible_display_row_range: Range<u32>,
+        visible_display_row_range: Range<DisplayRow>,
         scroll_pixel_position: gpui::Point<Pixels>,
         line_height: Pixels,
         line_layouts: &[LineWithInvisibles],
@@ -837,13 +849,14 @@ impl EditorElement {
                 let row = display_range.start.row();
                 debug_assert!(row < visible_display_row_range.end);
                 let line_layout = line_layouts
-                    .get((row - visible_display_row_range.start) as usize)
+                    .get(row.minus(visible_display_row_range.start) as usize)
                     .map(|l| &l.line)?;
 
                 let start_x = content_origin.x
                     + line_layout.x_for_index(display_range.start.column() as usize)
                     - scroll_pixel_position.x;
-                let start_y = content_origin.y + row as f32 * line_height - scroll_pixel_position.y;
+                let start_y =
+                    content_origin.y + row.as_f32() * line_height - scroll_pixel_position.y;
                 let end_x = content_origin.x
                     + line_layout.x_for_index(display_range.end.column() as usize)
                     - scroll_pixel_position.x;
@@ -922,7 +935,7 @@ impl EditorElement {
         &self,
         snapshot: &EditorSnapshot,
         selections: &[(PlayerColor, Vec<SelectionLayout>)],
-        visible_display_row_range: Range<u32>,
+        visible_display_row_range: Range<DisplayRow>,
         line_layouts: &[LineWithInvisibles],
         text_hitbox: &Hitbox,
         content_origin: gpui::Point<Pixels>,
@@ -946,7 +959,7 @@ impl EditorElement {
                     }
 
                     let cursor_row_layout = &line_layouts
-                        [(cursor_position.row() - visible_display_row_range.start) as usize]
+                        [cursor_position.row().minus(visible_display_row_range.start) as usize]
                         .line;
                     let cursor_column = cursor_position.column() as usize;
 
@@ -994,7 +1007,8 @@ impl EditorElement {
                     };
 
                     let x = cursor_character_x - scroll_pixel_position.x;
-                    let y = (cursor_position.row() as f32 - scroll_pixel_position.y / line_height)
+                    let y = (cursor_position.row().as_f32()
+                        - scroll_pixel_position.y / line_height)
                         * line_height;
                     if selection.is_newest {
                         editor.pixel_position_of_newest_cursor = Some(point(
@@ -1004,7 +1018,7 @@ impl EditorElement {
 
                         if autoscroll_containing_element {
                             let top = text_hitbox.origin.y
-                                + (cursor_position.row() as f32 - scroll_position.y - 3.).max(0.)
+                                + (cursor_position.row().as_f32() - scroll_position.y - 3.).max(0.)
                                     * line_height;
                             let left = text_hitbox.origin.x
                                 + (cursor_position.column() as f32 - scroll_position.x - 3.)
@@ -1012,7 +1026,7 @@ impl EditorElement {
                                     * em_width;
 
                             let bottom = text_hitbox.origin.y
-                                + (cursor_position.row() as f32 - scroll_position.y + 4.)
+                                + (cursor_position.row().as_f32() - scroll_position.y + 4.)
                                     * line_height;
                             let right = text_hitbox.origin.x
                                 + (cursor_position.column() as f32 - scroll_position.x + 4.)
@@ -1035,7 +1049,7 @@ impl EditorElement {
                     let cursor_name = selection.user_name.clone().map(|name| CursorName {
                         string: name,
                         color: self.style.background,
-                        is_top_row: cursor_position.row() == 0,
+                        is_top_row: cursor_position.row().0 == 0,
                     });
                     cursor.layout(content_origin, cursor_name, cx);
                     cursors.push(cursor);
@@ -1107,10 +1121,10 @@ impl EditorElement {
         );
 
         let height = bounds.size.height;
-        let total_rows = snapshot.max_point().row() as f32 + rows_per_page;
+        let total_rows = snapshot.max_point().row().as_f32() + rows_per_page;
         let px_per_row = height / total_rows;
         let thumb_height = (rows_per_page * px_per_row).max(ScrollbarLayout::MIN_THUMB_HEIGHT);
-        let row_height = (height - thumb_height) / snapshot.max_point().row() as f32;
+        let row_height = (height - thumb_height) / snapshot.max_point().row().as_f32();
 
         Some(ScrollbarLayout {
             hitbox: cx.insert_hitbox(track_bounds, false),
@@ -1124,7 +1138,7 @@ impl EditorElement {
     #[allow(clippy::too_many_arguments)]
     fn layout_gutter_fold_indicators(
         &self,
-        fold_statuses: Vec<Option<(FoldStatus, u32, bool)>>,
+        fold_statuses: Vec<Option<(FoldStatus, MultiBufferRow, bool)>>,
         line_height: Pixels,
         gutter_dimensions: &GutterDimensions,
         gutter_settings: crate::editor_settings::Gutter,
@@ -1176,18 +1190,22 @@ impl EditorElement {
         &self,
         line_height: Pixels,
         gutter_hitbox: &Hitbox,
-        display_rows: Range<u32>,
+        display_rows: Range<DisplayRow>,
         snapshot: &EditorSnapshot,
         cx: &mut WindowContext,
     ) -> Vec<(DisplayDiffHunk, Option<Hitbox>)> {
         let buffer_snapshot = &snapshot.buffer_snapshot;
 
-        let buffer_start_row = DisplayPoint::new(display_rows.start, 0)
-            .to_point(snapshot)
-            .row;
-        let buffer_end_row = DisplayPoint::new(display_rows.end, 0)
-            .to_point(snapshot)
-            .row;
+        let buffer_start_row = MultiBufferRow(
+            DisplayPoint::new(display_rows.start, 0)
+                .to_point(snapshot)
+                .row,
+        );
+        let buffer_end_row = MultiBufferRow(
+            DisplayPoint::new(display_rows.end, 0)
+                .to_point(snapshot)
+                .row,
+        );
 
         let expanded_hunk_display_rows = self.editor.update(cx, |editor, _| {
             editor
@@ -1244,7 +1262,7 @@ impl EditorElement {
     #[allow(clippy::too_many_arguments)]
     fn layout_inline_blame(
         &self,
-        display_row: u32,
+        display_row: DisplayRow,
         display_snapshot: &DisplaySnapshot,
         line_layout: &LineWithInvisibles,
         em_width: Pixels,
@@ -1268,7 +1286,7 @@ impl EditorElement {
             .map(|(w, _)| w.clone());
 
         let display_point = DisplayPoint::new(display_row, 0);
-        let buffer_row = display_point.to_point(display_snapshot).row;
+        let buffer_row = MultiBufferRow(display_point.to_point(display_snapshot).row);
 
         let blame = self.editor.read(cx).blame.clone()?;
         let blame_entry = blame
@@ -1281,7 +1299,7 @@ impl EditorElement {
             render_inline_blame_entry(&blame, blame_entry, &self.style, workspace, cx);
 
         let start_y = content_origin.y
-            + line_height * (display_row as f32 - scroll_pixel_position.y / line_height);
+            + line_height * (display_row.as_f32() - scroll_pixel_position.y / line_height);
 
         let start_x = {
             const INLINE_BLAME_PADDING_EM_WIDTHS: f32 = 6.;
@@ -1310,7 +1328,7 @@ impl EditorElement {
     #[allow(clippy::too_many_arguments)]
     fn layout_blame_entries(
         &self,
-        buffer_rows: impl Iterator<Item = Option<u32>>,
+        buffer_rows: impl Iterator<Item = Option<MultiBufferRow>>,
         em_width: Pixels,
         scroll_position: gpui::Point<f32>,
         line_height: Pixels,
@@ -1374,6 +1392,63 @@ impl EditorElement {
         Some(shaped_lines)
     }
 
+    fn layout_run_indicators(
+        &self,
+        line_height: Pixels,
+        scroll_pixel_position: gpui::Point<Pixels>,
+        gutter_dimensions: &GutterDimensions,
+        gutter_hitbox: &Hitbox,
+        snapshot: &EditorSnapshot,
+        cx: &mut WindowContext,
+    ) -> Vec<AnyElement> {
+        self.editor.update(cx, |editor, cx| {
+            let active_task_indicator_row =
+                if let Some(crate::ContextMenu::CodeActions(CodeActionsMenu {
+                    deployed_from_indicator,
+                    actions,
+                    ..
+                })) = editor.context_menu.read().as_ref()
+                {
+                    actions
+                        .tasks
+                        .as_ref()
+                        .map(|tasks| tasks.position.to_display_point(snapshot).row())
+                        .or_else(|| *deployed_from_indicator)
+                } else {
+                    None
+                };
+            editor
+                .tasks
+                .iter()
+                .filter_map(|(_, (multibuffer_offset, _))| {
+                    let multibuffer_point = multibuffer_offset.to_point(&snapshot.buffer_snapshot);
+                    let multibuffer_row = MultiBufferRow(multibuffer_point.row);
+                    if snapshot.is_line_folded(multibuffer_row) {
+                        return None;
+                    }
+                    let display_row = multibuffer_point.to_display_point(snapshot).row();
+                    let button = editor.render_run_indicator(
+                        &self.style,
+                        Some(display_row) == active_task_indicator_row,
+                        display_row,
+                        cx,
+                    );
+
+                    let button = prepaint_gutter_button(
+                        button,
+                        display_row,
+                        line_height,
+                        gutter_dimensions,
+                        scroll_pixel_position,
+                        gutter_hitbox,
+                        cx,
+                    );
+                    Some(button)
+                })
+                .collect_vec()
+        })
+    }
+
     fn layout_code_actions_indicator(
         &self,
         line_height: Pixels,
@@ -1385,35 +1460,28 @@ impl EditorElement {
     ) -> Option<AnyElement> {
         let mut active = false;
         let mut button = None;
+        let row = newest_selection_head.row();
         self.editor.update(cx, |editor, cx| {
-            active = matches!(
-                editor.context_menu.read().as_ref(),
-                Some(crate::ContextMenu::CodeActions(_))
-            );
-            button = editor.render_code_actions_indicator(&self.style, active, cx);
+            if let Some(crate::ContextMenu::CodeActions(CodeActionsMenu {
+                deployed_from_indicator,
+                ..
+            })) = editor.context_menu.read().as_ref()
+            {
+                active = deployed_from_indicator.map_or(true, |indicator_row| indicator_row == row);
+            };
+            button = editor.render_code_actions_indicator(&self.style, row, active, cx);
         });
 
-        let mut button = button?.into_any_element();
-        let available_space = size(
-            AvailableSpace::MinContent,
-            AvailableSpace::Definite(line_height),
+        let button = prepaint_gutter_button(
+            button?,
+            row,
+            line_height,
+            gutter_dimensions,
+            scroll_pixel_position,
+            gutter_hitbox,
+            cx,
         );
-        let indicator_size = button.layout_as_root(available_space, cx);
 
-        let blame_width = gutter_dimensions
-            .git_blame_entries_width
-            .unwrap_or(Pixels::ZERO);
-
-        let mut x = blame_width;
-        let available_width = gutter_dimensions.margin + gutter_dimensions.left_padding
-            - indicator_size.width
-            - blame_width;
-        x += available_width / 2.;
-
-        let mut y = newest_selection_head.row() as f32 * line_height - scroll_pixel_position.y;
-        y += (line_height - indicator_size.height) / 2.;
-
-        button.prepaint_as_root(gutter_hitbox.origin + point(x, y), available_space, cx);
         Some(button)
     }
 
@@ -1431,10 +1499,10 @@ impl EditorElement {
     fn calculate_relative_line_numbers(
         &self,
         snapshot: &EditorSnapshot,
-        rows: &Range<u32>,
-        relative_to: Option<u32>,
-    ) -> HashMap<u32, u32> {
-        let mut relative_rows: HashMap<u32, u32> = Default::default();
+        rows: &Range<DisplayRow>,
+        relative_to: Option<DisplayRow>,
+    ) -> HashMap<DisplayRow, DisplayRowDelta> {
+        let mut relative_rows: HashMap<DisplayRow, DisplayRowDelta> = Default::default();
         let Some(relative_to) = relative_to else {
             return relative_rows;
         };
@@ -1443,17 +1511,17 @@ impl EditorElement {
         let end = rows.end.max(relative_to);
 
         let buffer_rows = snapshot
-            .buffer_rows(start)
-            .take(1 + (end - start) as usize)
+            .display_rows(start)
+            .take(1 + end.minus(start) as usize)
             .collect::<Vec<_>>();
 
-        let head_idx = relative_to - start;
+        let head_idx = relative_to.minus(start);
         let mut delta = 1;
         let mut i = head_idx + 1;
         while i < buffer_rows.len() as u32 {
             if buffer_rows[i as usize].is_some() {
-                if rows.contains(&(i + start)) {
-                    relative_rows.insert(i + start, delta);
+                if rows.contains(&DisplayRow(i + start.0)) {
+                    relative_rows.insert(DisplayRow(i + start.0), delta);
                 }
                 delta += 1;
             }
@@ -1468,8 +1536,8 @@ impl EditorElement {
         while i > 0 {
             i -= 1;
             if buffer_rows[i as usize].is_some() {
-                if rows.contains(&(i + start)) {
-                    relative_rows.insert(i + start, delta);
+                if rows.contains(&DisplayRow(i + start.0)) {
+                    relative_rows.insert(DisplayRow(i + start.0), delta);
                 }
                 delta += 1;
             }
@@ -1480,15 +1548,15 @@ impl EditorElement {
 
     fn layout_line_numbers(
         &self,
-        rows: Range<u32>,
-        buffer_rows: impl Iterator<Item = Option<u32>>,
-        active_rows: &BTreeMap<u32, bool>,
+        rows: Range<DisplayRow>,
+        buffer_rows: impl Iterator<Item = Option<DisplayRow>>,
+        active_rows: &BTreeMap<DisplayRow, bool>,
         newest_selection_head: Option<DisplayPoint>,
         snapshot: &EditorSnapshot,
         cx: &WindowContext,
     ) -> (
         Vec<Option<ShapedLine>>,
-        Vec<Option<(FoldStatus, BufferRow, bool)>>,
+        Vec<Option<(FoldStatus, MultiBufferRow, bool)>>,
     ) {
         let editor = self.editor.read(cx);
         let is_singleton = editor.is_singleton(cx);
@@ -1523,20 +1591,20 @@ impl EditorElement {
         let relative_rows = self.calculate_relative_line_numbers(snapshot, &rows, relative_to);
 
         for (ix, row) in buffer_rows.into_iter().enumerate() {
-            let display_row = rows.start + ix as u32;
+            let display_row = DisplayRow(rows.start.0 + ix as u32);
             let (active, color) = if active_rows.contains_key(&display_row) {
                 (true, cx.theme().colors().editor_active_line_number)
             } else {
                 (false, cx.theme().colors().editor_line_number)
             };
-            if let Some(buffer_row) = row {
+            if let Some(display_row) = row {
                 if include_line_numbers {
                     line_number.clear();
-                    let default_number = buffer_row + 1;
+                    let default_number = display_row.0 + 1;
                     let number = relative_rows
-                        .get(&(ix as u32 + rows.start))
+                        .get(&DisplayRow(ix as u32 + rows.start.0))
                         .unwrap_or(&default_number);
-                    write!(&mut line_number, "{}", number).unwrap();
+                    write!(&mut line_number, "{number}").unwrap();
                     let run = TextRun {
                         len: line_number.len(),
                         font: self.style.text.font(),
@@ -1555,9 +1623,12 @@ impl EditorElement {
                     fold_statuses.push(
                         is_singleton
                             .then(|| {
+                                let multibuffer_point =
+                                    DisplayPoint::new(display_row, 0).to_point(snapshot);
+                                let multibuffer_row = MultiBufferRow(multibuffer_point.row);
                                 snapshot
-                                    .fold_for_line(buffer_row)
-                                    .map(|fold_status| (fold_status, buffer_row, active))
+                                    .fold_for_line(multibuffer_row)
+                                    .map(|fold_status| (fold_status, multibuffer_row, active))
                             })
                             .flatten(),
                     )
@@ -1573,7 +1644,7 @@ impl EditorElement {
 
     fn layout_lines(
         &self,
-        rows: Range<u32>,
+        rows: Range<DisplayRow>,
         line_number_layouts: &[Option<ShapedLine>],
         snapshot: &EditorSnapshot,
         cx: &WindowContext,
@@ -1592,7 +1663,7 @@ impl EditorElement {
                 .as_ref()
                 .map_or("", AsRef::as_ref)
                 .split('\n')
-                .skip(rows.start as usize)
+                .skip(rows.start.0 as usize)
                 .chain(iter::repeat(""))
                 .take(rows.len());
             placeholder_lines
@@ -1631,7 +1702,7 @@ impl EditorElement {
     #[allow(clippy::too_many_arguments)]
     fn build_blocks(
         &self,
-        rows: Range<u32>,
+        rows: Range<DisplayRow>,
         snapshot: &EditorSnapshot,
         hitbox: &Hitbox,
         text_hitbox: &Hitbox,
@@ -1654,7 +1725,7 @@ impl EditorElement {
         let render_block = |block: &TransformBlock,
                             available_space: Size<AvailableSpace>,
                             block_id: usize,
-                            block_row_start: u32,
+                            block_row_start: DisplayRow,
                             cx: &mut WindowContext| {
             let mut element = match block {
                 TransformBlock::Custom(block) => {
@@ -1664,7 +1735,7 @@ impl EditorElement {
                         .to_display_point(snapshot);
                     let anchor_x = text_x
                         + if rows.contains(&align_to.row()) {
-                            line_layouts[(align_to.row() - rows.start) as usize]
+                            line_layouts[align_to.row().minus(rows.start) as usize]
                                 .line
                                 .x_for_index(align_to.column() as usize)
                         } else {
@@ -1730,7 +1801,7 @@ impl EditorElement {
                         };
 
                         let line_offset_from_top =
-                            block_row_start + *height as u32 + offset_from_excerpt_start
+                            block_row_start.0 + *height as u32 + offset_from_excerpt_start
                                 - snapshot
                                     .scroll_anchor
                                     .scroll_position(&snapshot.display_snapshot)
@@ -1769,7 +1840,7 @@ impl EditorElement {
                                     .pr(gpui::px(8.))
                                     .rounded_md()
                                     .shadow_md()
-                                    .border()
+                                    .border_1()
                                     .border_color(cx.theme().colors().border)
                                     .bg(cx.theme().colors().editor_subheader_background)
                                     .justify_between()
@@ -1982,7 +2053,7 @@ impl EditorElement {
             let mut origin = hitbox.origin
                 + point(
                     Pixels::ZERO,
-                    block.row as f32 * line_height - scroll_pixel_position.y,
+                    block.row.as_f32() * line_height - scroll_pixel_position.y,
                 );
             if !matches!(block.style, BlockStyle::Sticky) {
                 origin += point(-scroll_pixel_position.x, Pixels::ZERO);
@@ -2000,7 +2071,7 @@ impl EditorElement {
         hitbox: &Hitbox,
         text_hitbox: &Hitbox,
         content_origin: gpui::Point<Pixels>,
-        start_row: u32,
+        start_row: DisplayRow,
         scroll_pixel_position: gpui::Point<Pixels>,
         line_layouts: &[LineWithInvisibles],
         newest_selection_head: DisplayPoint,
@@ -2026,17 +2097,17 @@ impl EditorElement {
 
         let (x, y) = match position {
             crate::ContextMenuOrigin::EditorPoint(point) => {
-                let cursor_row_layout = &line_layouts[(point.row() - start_row) as usize].line;
+                let cursor_row_layout = &line_layouts[point.row().minus(start_row) as usize].line;
                 let x = cursor_row_layout.x_for_index(point.column() as usize)
                     - scroll_pixel_position.x;
-                let y = (point.row() + 1) as f32 * line_height - scroll_pixel_position.y;
+                let y = point.row().next_row().as_f32() * line_height - scroll_pixel_position.y;
                 (x, y)
             }
             crate::ContextMenuOrigin::GutterIndicator(row) => {
                 // Context menu was spawned via a click on a gutter. Ensure it's a bit closer to the indicator than just a plain first column of the
                 // text field.
                 let x = -gutter_overshoot;
-                let y = (row + 1) as f32 * line_height - scroll_pixel_position.y;
+                let y = row.next_row().as_f32() * line_height - scroll_pixel_position.y;
                 (x, y)
             }
         };
@@ -2081,7 +2152,7 @@ impl EditorElement {
         snapshot: &EditorSnapshot,
         hitbox: &Hitbox,
         text_hitbox: &Hitbox,
-        visible_display_row_range: Range<u32>,
+        visible_display_row_range: Range<DisplayRow>,
         content_origin: gpui::Point<Pixels>,
         scroll_pixel_position: gpui::Point<Pixels>,
         line_layouts: &[LineWithInvisibles],
@@ -2122,12 +2193,12 @@ impl EditorElement {
 
         // This is safe because we check on layout whether the required row is available
         let hovered_row_layout =
-            &line_layouts[(position.row() - visible_display_row_range.start) as usize].line;
+            &line_layouts[position.row().minus(visible_display_row_range.start) as usize].line;
 
         // Compute Hovered Point
         let x =
             hovered_row_layout.x_for_index(position.column() as usize) - scroll_pixel_position.x;
-        let y = position.row() as f32 * line_height - scroll_pixel_position.y;
+        let y = position.row().as_f32() * line_height - scroll_pixel_position.y;
         let hovered_point = content_origin + point(x, y);
 
         let mut overall_height = Pixels::ZERO;
@@ -2203,10 +2274,14 @@ impl EditorElement {
             if let EditorMode::Full = layout.mode {
                 let mut active_rows = layout.active_rows.iter().peekable();
                 while let Some((start_row, contains_non_empty_selection)) = active_rows.next() {
-                    let mut end_row = *start_row;
-                    while active_rows.peek().map_or(false, |r| {
-                        *r.0 == end_row + 1 && r.1 == contains_non_empty_selection
-                    }) {
+                    let mut end_row = start_row.0;
+                    while active_rows
+                        .peek()
+                        .map_or(false, |(active_row, has_selection)| {
+                            active_row.0 == end_row + 1
+                                && *has_selection == contains_non_empty_selection
+                        })
+                    {
                         active_rows.next().unwrap();
                         end_row += 1;
                     }
@@ -2215,12 +2290,12 @@ impl EditorElement {
                         let origin = point(
                             layout.hitbox.origin.x,
                             layout.hitbox.origin.y
-                                + (*start_row as f32 - scroll_top)
+                                + (start_row.as_f32() - scroll_top)
                                     * layout.position_map.line_height,
                         );
                         let size = size(
                             layout.hitbox.size.width,
-                            layout.position_map.line_height * (end_row - start_row + 1) as f32,
+                            layout.position_map.line_height * (end_row - start_row.0 + 1) as f32,
                         );
                         let active_line_bg = cx.theme().colors().editor_active_line_background;
                         cx.paint_quad(fill(Bounds { origin, size }, active_line_bg));
@@ -2228,28 +2303,28 @@ impl EditorElement {
                 }
 
                 let mut paint_highlight =
-                    |highlight_row_start: u32, highlight_row_end: u32, color| {
+                    |highlight_row_start: DisplayRow, highlight_row_end: DisplayRow, color| {
                         let origin = point(
                             layout.hitbox.origin.x,
                             layout.hitbox.origin.y
-                                + (highlight_row_start as f32 - scroll_top)
+                                + (highlight_row_start.as_f32() - scroll_top)
                                     * layout.position_map.line_height,
                         );
                         let size = size(
                             layout.hitbox.size.width,
                             layout.position_map.line_height
-                                * (highlight_row_end + 1 - highlight_row_start) as f32,
+                                * highlight_row_end.next_row().minus(highlight_row_start) as f32,
                         );
                         cx.paint_quad(fill(Bounds { origin, size }, color));
                     };
 
-                let mut current_paint: Option<(Hsla, Range<u32>)> = None;
+                let mut current_paint: Option<(Hsla, Range<DisplayRow>)> = None;
                 for (&new_row, &new_color) in &layout.highlighted_rows {
                     match &mut current_paint {
                         Some((current_color, current_range)) => {
                             let current_color = *current_color;
-                            let new_range_started =
-                                current_color != new_color || current_range.end + 1 != new_row;
+                            let new_range_started = current_color != new_color
+                                || current_range.end.next_row() != new_row;
                             if new_range_started {
                                 paint_highlight(
                                     current_range.start,
@@ -2259,7 +2334,7 @@ impl EditorElement {
                                 current_paint = Some((new_color, new_row..new_row));
                                 continue;
                             } else {
-                                current_range.end += 1;
+                                current_range.end = current_range.end.next_row();
                             }
                         }
                         None => current_paint = Some((new_color, new_row..new_row)),
@@ -2351,6 +2426,10 @@ impl EditorElement {
                 }
             });
 
+            for test_indicators in layout.test_indicators.iter_mut() {
+                test_indicators.paint(cx);
+            }
+
             if let Some(indicator) = layout.code_actions_indicator.as_mut() {
                 indicator.paint(cx);
             }
@@ -2428,7 +2507,7 @@ impl EditorElement {
 
         match hunk {
             DisplayDiffHunk::Folded { display_row, .. } => {
-                let start_y = *display_row as f32 * line_height - scroll_top;
+                let start_y = display_row.as_f32() * line_height - scroll_top;
                 let end_y = start_y + line_height;
 
                 let width = 0.275 * line_height;
@@ -2461,8 +2540,8 @@ impl EditorElement {
                         })
                         .unwrap_or(end_row);
 
-                    let start_y = start_row as f32 * line_height - scroll_top;
-                    let end_y = end_row_in_current_excerpt as f32 * line_height - scroll_top;
+                    let start_y = start_row.as_f32() * line_height - scroll_top;
+                    let end_y = end_row_in_current_excerpt.as_f32() * line_height - scroll_top;
 
                     let width = 0.275 * line_height;
                     let highlight_origin = bounds.origin + point(-width, start_y);
@@ -2473,7 +2552,7 @@ impl EditorElement {
                     let row = display_row_range.start;
 
                     let offset = line_height / 2.;
-                    let start_y = row as f32 * line_height - offset - scroll_top;
+                    let start_y = row.as_f32() * line_height - offset - scroll_top;
                     let end_y = start_y + line_height;
 
                     let width = 0.35 * line_height;
@@ -2582,7 +2661,7 @@ impl EditorElement {
             .show_whitespaces;
 
         for (ix, line_with_invisibles) in layout.position_map.line_layouts.iter().enumerate() {
-            let row = layout.visible_display_row_range.start + ix as u32;
+            let row = DisplayRow(layout.visible_display_row_range.start.0 + ix as u32);
             line_with_invisibles.draw(
                 layout,
                 row,
@@ -2800,7 +2879,6 @@ impl EditorElement {
             let snapshot = layout.position_map.snapshot.clone();
             let theme = cx.theme().clone();
             let scrollbar_settings = EditorSettings::get_global(cx).scrollbar;
-            let max_row = layout.max_row;
 
             editor.scrollbar_marker_state.dirty = false;
             editor.scrollbar_marker_state.pending_refresh =
@@ -2809,25 +2887,27 @@ impl EditorElement {
                     let scrollbar_markers = cx
                         .background_executor()
                         .spawn(async move {
+                            let max_point = snapshot.display_snapshot.buffer_snapshot.max_point();
                             let mut marker_quads = Vec::new();
-
                             if scrollbar_settings.git_diff {
                                 let marker_row_ranges = snapshot
                                     .buffer_snapshot
-                                    .git_diff_hunks_in_range(0..max_row)
+                                    .git_diff_hunks_in_range(
+                                        MultiBufferRow::MIN..MultiBufferRow::MAX,
+                                    )
                                     .map(|hunk| {
                                         let start_display_row =
-                                            Point::new(hunk.associated_range.start, 0)
+                                            MultiBufferPoint::new(hunk.associated_range.start.0, 0)
                                                 .to_display_point(&snapshot.display_snapshot)
                                                 .row();
                                         let mut end_display_row =
-                                            Point::new(hunk.associated_range.end, 0)
+                                            MultiBufferPoint::new(hunk.associated_range.end.0, 0)
                                                 .to_display_point(&snapshot.display_snapshot)
                                                 .row();
                                         if end_display_row != start_display_row {
-                                            end_display_row -= 1;
+                                            end_display_row.0 -= 1;
                                         }
-                                        let color = match hunk.status() {
+                                        let color = match hunk_status(&hunk) {
                                             DiffHunkStatus::Added => theme.status().created,
                                             DiffHunkStatus::Modified => theme.status().modified,
                                             DiffHunkStatus::Removed => theme.status().deleted,
@@ -2883,9 +2963,6 @@ impl EditorElement {
                             }
 
                             if scrollbar_settings.diagnostics {
-                                let max_point =
-                                    snapshot.display_snapshot.buffer_snapshot.max_point();
-
                                 let diagnostics = snapshot
                                     .buffer_snapshot
                                     .diagnostics_in_range::<_, Point>(
@@ -2956,7 +3033,8 @@ impl EditorElement {
             let row_range = if range.end.column() == 0 {
                 cmp::max(range.start.row(), start_row)..cmp::min(range.end.row(), end_row)
             } else {
-                cmp::max(range.start.row(), start_row)..cmp::min(range.end.row() + 1, end_row)
+                cmp::max(range.start.row(), start_row)
+                    ..cmp::min(range.end.row().next_row(), end_row)
             };
 
             let highlighted_range = HighlightedRange {
@@ -2964,13 +3042,13 @@ impl EditorElement {
                 line_height: layout.position_map.line_height,
                 corner_radius,
                 start_y: layout.content_origin.y
-                    + row_range.start as f32 * layout.position_map.line_height
+                    + row_range.start.as_f32() * layout.position_map.line_height
                     - layout.position_map.scroll_pixel_position.y,
                 lines: row_range
-                    .into_iter()
+                    .iter_rows()
                     .map(|row| {
                         let line_layout =
-                            &layout.position_map.line_layouts[(row - start_row) as usize].line;
+                            &layout.position_map.line_layouts[row.minus(start_row) as usize].line;
                         HighlightedRangeLine {
                             start_x: if row == range.start.row() {
                                 layout.content_origin.x
@@ -3219,9 +3297,48 @@ impl EditorElement {
     }
 
     fn max_line_number_width(&self, snapshot: &EditorSnapshot, cx: &WindowContext) -> Pixels {
-        let digit_count = (snapshot.max_buffer_row() as f32 + 1.).log10().floor() as usize + 1;
+        let digit_count = snapshot
+            .max_buffer_row()
+            .next_row()
+            .as_f32()
+            .log10()
+            .floor() as usize
+            + 1;
         self.column_pixels(digit_count, cx)
     }
+}
+
+fn prepaint_gutter_button(
+    button: IconButton,
+    row: DisplayRow,
+    line_height: Pixels,
+    gutter_dimensions: &GutterDimensions,
+    scroll_pixel_position: gpui::Point<Pixels>,
+    gutter_hitbox: &Hitbox,
+    cx: &mut WindowContext<'_>,
+) -> AnyElement {
+    let mut button = button.into_any_element();
+    let available_space = size(
+        AvailableSpace::MinContent,
+        AvailableSpace::Definite(line_height),
+    );
+    let indicator_size = button.layout_as_root(available_space, cx);
+
+    let blame_width = gutter_dimensions
+        .git_blame_entries_width
+        .unwrap_or(Pixels::ZERO);
+
+    let mut x = blame_width;
+    let available_width = gutter_dimensions.margin + gutter_dimensions.left_padding
+        - indicator_size.width
+        - blame_width;
+    x += available_width / 2.;
+
+    let mut y = row.as_f32() * line_height - scroll_pixel_position.y;
+    y += (line_height - indicator_size.height) / 2.;
+
+    button.prepaint_as_root(gutter_hitbox.origin + point(x, y), available_space, cx);
+    button
 }
 
 fn render_inline_blame_entry(
@@ -3279,8 +3396,7 @@ fn render_blame_entry(
 
     let relative_timestamp = blame_entry_relative_timestamp(&blame_entry, cx);
 
-    let pretty_commit_id = format!("{}", blame_entry.sha);
-    let short_commit_id = pretty_commit_id.chars().take(6).collect::<String>();
+    let short_commit_id = blame_entry.sha.display_short();
 
     let author_name = blame_entry.author.as_deref().unwrap_or("<no name>");
     let name = util::truncate_and_trailoff(author_name, 20);
@@ -3469,15 +3585,15 @@ impl LineWithInvisibles {
     fn draw(
         &self,
         layout: &EditorLayout,
-        row: u32,
+        row: DisplayRow,
         content_origin: gpui::Point<Pixels>,
         whitespace_setting: ShowWhitespaceSetting,
         selection_ranges: &[Range<DisplayPoint>],
         cx: &mut WindowContext,
     ) {
         let line_height = layout.position_map.line_height;
-        let line_y =
-            line_height * (row as f32 - layout.position_map.scroll_pixel_position.y / line_height);
+        let line_y = line_height
+            * (row.as_f32() - layout.position_map.scroll_pixel_position.y / line_height);
 
         let line_origin =
             content_origin + gpui::point(-layout.position_map.scroll_pixel_position.x, line_y);
@@ -3502,7 +3618,7 @@ impl LineWithInvisibles {
         layout: &EditorLayout,
         content_origin: gpui::Point<Pixels>,
         line_y: Pixels,
-        row: u32,
+        row: DisplayRow,
         line_height: Pixels,
         whitespace_setting: ShowWhitespaceSetting,
         cx: &mut WindowContext,
@@ -3570,31 +3686,35 @@ impl Element for EditorElement {
                     let mut style = Style::default();
                     style.size.width = relative(1.).into();
                     style.size.height = self.style.text.line_height_in_pixels(rem_size).into();
-                    cx.request_layout(&style, None)
+                    cx.request_layout(style, None)
                 }
                 EditorMode::AutoHeight { max_lines } => {
                     let editor_handle = cx.view().clone();
                     let max_line_number_width =
                         self.max_line_number_width(&editor.snapshot(cx), cx);
-                    cx.request_measured_layout(Style::default(), move |known_dimensions, _, cx| {
-                        editor_handle
-                            .update(cx, |editor, cx| {
-                                compute_auto_height_layout(
-                                    editor,
-                                    max_lines,
-                                    max_line_number_width,
-                                    known_dimensions,
-                                    cx,
-                                )
-                            })
-                            .unwrap_or_default()
-                    })
+                    cx.request_measured_layout(
+                        Style::default(),
+                        move |known_dimensions, available_space, cx| {
+                            editor_handle
+                                .update(cx, |editor, cx| {
+                                    compute_auto_height_layout(
+                                        editor,
+                                        max_lines,
+                                        max_line_number_width,
+                                        known_dimensions,
+                                        available_space.width,
+                                        cx,
+                                    )
+                                })
+                                .unwrap_or_default()
+                        },
+                    )
                 }
                 EditorMode::Full => {
                     let mut style = Style::default();
                     style.size.width = relative(1.).into();
                     style.size.height = relative(1.).into();
-                    cx.request_layout(&style, None)
+                    cx.request_layout(style, None)
                 }
             };
 
@@ -3708,19 +3828,20 @@ impl Element for EditorElement {
                 let mut scroll_position = snapshot.scroll_position();
                 // The scroll position is a fractional point, the whole number of which represents
                 // the top of the window in terms of display rows.
-                let start_row = scroll_position.y as u32;
+                let start_row = DisplayRow(scroll_position.y as u32);
                 let height_in_lines = bounds.size.height / line_height;
                 let max_row = snapshot.max_point().row();
                 let end_row = cmp::min(
                     (scroll_position.y + height_in_lines).ceil() as u32,
-                    max_row + 1,
+                    max_row.next_row().0,
                 );
+                let end_row = DisplayRow(end_row);
 
                 let buffer_rows = snapshot
-                    .buffer_rows(start_row)
+                    .display_rows(start_row)
                     .take((start_row..end_row).len());
 
-                let start_anchor = if start_row == 0 {
+                let start_anchor = if start_row == Default::default() {
                     Anchor::min()
                 } else {
                     snapshot.buffer_snapshot.anchor_before(
@@ -3816,7 +3937,7 @@ impl Element for EditorElement {
                 if let Some(newest_selection_head) = newest_selection_head {
                     let display_row = newest_selection_head.row();
                     if (start_row..end_row).contains(&display_row) {
-                        let line_layout = &line_layouts[(display_row - start_row) as usize];
+                        let line_layout = &line_layouts[display_row.minus(start_row) as usize];
                         inline_blame = self.layout_inline_blame(
                             display_row,
                             &snapshot.display_snapshot,
@@ -3831,7 +3952,11 @@ impl Element for EditorElement {
                 }
 
                 let blamed_display_rows = self.layout_blame_entries(
-                    buffer_rows,
+                    buffer_rows.map(|display_row| {
+                        display_row.map(|row| {
+                            MultiBufferRow(DisplayPoint::new(row, 0).to_point(&snapshot).row)
+                        })
+                    }),
                     em_width,
                     scroll_position,
                     line_height,
@@ -3842,7 +3967,7 @@ impl Element for EditorElement {
 
                 let scroll_max = point(
                     ((scroll_width - text_hitbox.size.width) / em_width).max(0.0),
-                    max_row as f32,
+                    max_row.as_f32(),
                 );
 
                 self.editor.update(cx, |editor, cx| {
@@ -3939,17 +4064,40 @@ impl Element for EditorElement {
                             cx,
                         );
                         if gutter_settings.code_actions {
-                            code_actions_indicator = self.layout_code_actions_indicator(
-                                line_height,
-                                newest_selection_head,
-                                scroll_pixel_position,
-                                &gutter_dimensions,
-                                &gutter_hitbox,
-                                cx,
-                            );
+                            let newest_selection_point =
+                                newest_selection_head.to_point(&snapshot.display_snapshot);
+                            let buffer = snapshot
+                                .buffer_snapshot
+                                .buffer_line_for_row(MultiBufferRow(newest_selection_point.row));
+                            if let Some((buffer, range)) = buffer {
+                                let buffer_id = buffer.remote_id();
+                                let row = range.start.row;
+                                let has_test_indicator =
+                                    self.editor.read(cx).tasks.contains_key(&(buffer_id, row));
+
+                                if !has_test_indicator {
+                                    code_actions_indicator = self.layout_code_actions_indicator(
+                                        line_height,
+                                        newest_selection_head,
+                                        scroll_pixel_position,
+                                        &gutter_dimensions,
+                                        &gutter_hitbox,
+                                        cx,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
+
+                let test_indicators = self.layout_run_indicators(
+                    line_height,
+                    scroll_pixel_position,
+                    &gutter_dimensions,
+                    &gutter_hitbox,
+                    &snapshot,
+                    cx,
+                );
 
                 if !context_menu_visible && !cx.has_active_drag() {
                     self.layout_hover_popovers(
@@ -4036,7 +4184,6 @@ impl Element for EditorElement {
                     gutter_dimensions,
                     content_origin,
                     scrollbar_layout,
-                    max_row,
                     active_rows,
                     highlighted_rows,
                     highlighted_ranges,
@@ -4051,6 +4198,7 @@ impl Element for EditorElement {
                     visible_cursors,
                     selections,
                     mouse_context_menu,
+                    test_indicators,
                     code_actions_indicator,
                     fold_indicators,
                     tab_invisible,
@@ -4142,8 +4290,6 @@ impl IntoElement for EditorElement {
     }
 }
 
-type BufferRow = u32;
-
 pub struct EditorLayout {
     position_map: Arc<PositionMap>,
     hitbox: Hitbox,
@@ -4154,9 +4300,9 @@ pub struct EditorLayout {
     scrollbar_layout: Option<ScrollbarLayout>,
     mode: EditorMode,
     wrap_guides: SmallVec<[(Pixels, bool); 2]>,
-    visible_display_row_range: Range<u32>,
-    active_rows: BTreeMap<u32, bool>,
-    highlighted_rows: BTreeMap<u32, Hsla>,
+    visible_display_row_range: Range<DisplayRow>,
+    active_rows: BTreeMap<DisplayRow, bool>,
+    highlighted_rows: BTreeMap<DisplayRow, Hsla>,
     line_numbers: Vec<Option<ShapedLine>>,
     display_hunks: Vec<(DisplayDiffHunk, Option<Hitbox>)>,
     blamed_display_rows: Option<Vec<AnyElement>>,
@@ -4168,8 +4314,8 @@ pub struct EditorLayout {
     cursors: Vec<(DisplayPoint, Hsla)>,
     visible_cursors: Vec<CursorLayout>,
     selections: Vec<(PlayerColor, Vec<SelectionLayout>)>,
-    max_row: u32,
     code_actions_indicator: Option<AnyElement>,
+    test_indicators: Vec<AnyElement>,
     fold_indicators: Vec<Option<AnyElement>>,
     mouse_context_menu: Option<AnyElement>,
     tab_invisible: ShapedLine,
@@ -4218,7 +4364,7 @@ impl ScrollbarLayout {
 
     fn marker_quads_for_ranges(
         &self,
-        row_ranges: impl IntoIterator<Item = ColoredRange<u32>>,
+        row_ranges: impl IntoIterator<Item = ColoredRange<DisplayRow>>,
         column: Option<usize>,
     ) -> Vec<PaintQuad> {
         struct MinMax {
@@ -4249,7 +4395,7 @@ impl ScrollbarLayout {
             )
         };
 
-        let row_to_y = |row: u32| row as f32 * self.row_height;
+        let row_to_y = |row: DisplayRow| row.as_f32() * self.row_height;
         let mut pixel_ranges = row_ranges
             .into_iter()
             .map(|range| {
@@ -4354,7 +4500,7 @@ impl PositionMap {
             (0, x)
         };
 
-        let mut exact_unclipped = DisplayPoint::new(row, column);
+        let mut exact_unclipped = DisplayPoint::new(DisplayRow(row), column);
         let previous_valid = self.snapshot.clip_point(exact_unclipped, Bias::Left);
         let next_valid = self.snapshot.clip_point(exact_unclipped, Bias::Right);
 
@@ -4370,34 +4516,40 @@ impl PositionMap {
 }
 
 struct BlockLayout {
-    row: u32,
+    row: DisplayRow,
     element: AnyElement,
     available_space: Size<AvailableSpace>,
     style: BlockStyle,
 }
 
 fn layout_line(
-    row: u32,
+    row: DisplayRow,
     snapshot: &EditorSnapshot,
     style: &EditorStyle,
     cx: &WindowContext,
 ) -> Result<ShapedLine> {
     let mut line = snapshot.line(row);
 
-    if line.len() > MAX_LINE_LEN {
-        let mut len = MAX_LINE_LEN;
-        while !line.is_char_boundary(len) {
-            len -= 1;
-        }
+    let len = {
+        let line_len = line.len();
+        if line_len > MAX_LINE_LEN {
+            let mut len = MAX_LINE_LEN;
+            while !line.is_char_boundary(len) {
+                len -= 1;
+            }
 
-        line.truncate(len);
-    }
+            line.truncate(len);
+            len
+        } else {
+            line_len
+        }
+    };
 
     cx.text_system().shape_line(
         line.into(),
         style.text.font_size.to_pixels(cx.rem_size()),
         &[TextRun {
-            len: snapshot.line_len(row) as usize,
+            len,
             font: style.text.font(),
             color: Hsla::default(),
             background_color: None,
@@ -4708,10 +4860,10 @@ mod tests {
             .update_window(*window, |_, cx| {
                 element
                     .layout_line_numbers(
-                        0..6,
-                        (0..6).map(Some),
+                        DisplayRow(0)..DisplayRow(6),
+                        (0..6).map(DisplayRow).map(Some),
                         &Default::default(),
-                        Some(DisplayPoint::new(0, 0)),
+                        Some(DisplayPoint::new(DisplayRow(0), 0)),
                         &snapshot,
                         cx,
                     )
@@ -4723,39 +4875,51 @@ mod tests {
         let relative_rows = window
             .update(cx, |editor, cx| {
                 let snapshot = editor.snapshot(cx);
-                element.calculate_relative_line_numbers(&snapshot, &(0..6), Some(3))
+                element.calculate_relative_line_numbers(
+                    &snapshot,
+                    &(DisplayRow(0)..DisplayRow(6)),
+                    Some(DisplayRow(3)),
+                )
             })
             .unwrap();
-        assert_eq!(relative_rows[&0], 3);
-        assert_eq!(relative_rows[&1], 2);
-        assert_eq!(relative_rows[&2], 1);
+        assert_eq!(relative_rows[&DisplayRow(0)], 3);
+        assert_eq!(relative_rows[&DisplayRow(1)], 2);
+        assert_eq!(relative_rows[&DisplayRow(2)], 1);
         // current line has no relative number
-        assert_eq!(relative_rows[&4], 1);
-        assert_eq!(relative_rows[&5], 2);
+        assert_eq!(relative_rows[&DisplayRow(4)], 1);
+        assert_eq!(relative_rows[&DisplayRow(5)], 2);
 
         // works if cursor is before screen
         let relative_rows = window
             .update(cx, |editor, cx| {
                 let snapshot = editor.snapshot(cx);
-                element.calculate_relative_line_numbers(&snapshot, &(3..6), Some(1))
+                element.calculate_relative_line_numbers(
+                    &snapshot,
+                    &(DisplayRow(3)..DisplayRow(6)),
+                    Some(DisplayRow(1)),
+                )
             })
             .unwrap();
         assert_eq!(relative_rows.len(), 3);
-        assert_eq!(relative_rows[&3], 2);
-        assert_eq!(relative_rows[&4], 3);
-        assert_eq!(relative_rows[&5], 4);
+        assert_eq!(relative_rows[&DisplayRow(3)], 2);
+        assert_eq!(relative_rows[&DisplayRow(4)], 3);
+        assert_eq!(relative_rows[&DisplayRow(5)], 4);
 
         // works if cursor is after screen
         let relative_rows = window
             .update(cx, |editor, cx| {
                 let snapshot = editor.snapshot(cx);
-                element.calculate_relative_line_numbers(&snapshot, &(0..3), Some(6))
+                element.calculate_relative_line_numbers(
+                    &snapshot,
+                    &(DisplayRow(0)..DisplayRow(3)),
+                    Some(DisplayRow(6)),
+                )
             })
             .unwrap();
         assert_eq!(relative_rows.len(), 3);
-        assert_eq!(relative_rows[&0], 5);
-        assert_eq!(relative_rows[&1], 4);
-        assert_eq!(relative_rows[&2], 3);
+        assert_eq!(relative_rows[&DisplayRow(0)], 5);
+        assert_eq!(relative_rows[&DisplayRow(1)], 4);
+        assert_eq!(relative_rows[&DisplayRow(2)], 3);
     }
 
     #[gpui::test]
@@ -4791,30 +4955,39 @@ mod tests {
         let local_selections = &state.selections[0].1;
         assert_eq!(local_selections.len(), 3);
         // moves cursor back one line
-        assert_eq!(local_selections[0].head, DisplayPoint::new(0, 6));
+        assert_eq!(
+            local_selections[0].head,
+            DisplayPoint::new(DisplayRow(0), 6)
+        );
         assert_eq!(
             local_selections[0].range,
-            DisplayPoint::new(0, 0)..DisplayPoint::new(1, 0)
+            DisplayPoint::new(DisplayRow(0), 0)..DisplayPoint::new(DisplayRow(1), 0)
         );
 
         // moves cursor back one column
         assert_eq!(
             local_selections[1].range,
-            DisplayPoint::new(3, 2)..DisplayPoint::new(3, 3)
+            DisplayPoint::new(DisplayRow(3), 2)..DisplayPoint::new(DisplayRow(3), 3)
         );
-        assert_eq!(local_selections[1].head, DisplayPoint::new(3, 2));
+        assert_eq!(
+            local_selections[1].head,
+            DisplayPoint::new(DisplayRow(3), 2)
+        );
 
         // leaves cursor on the max point
         assert_eq!(
             local_selections[2].range,
-            DisplayPoint::new(5, 6)..DisplayPoint::new(6, 0)
+            DisplayPoint::new(DisplayRow(5), 6)..DisplayPoint::new(DisplayRow(6), 0)
         );
-        assert_eq!(local_selections[2].head, DisplayPoint::new(6, 0));
+        assert_eq!(
+            local_selections[2].head,
+            DisplayPoint::new(DisplayRow(6), 0)
+        );
 
         // active lines does not include 1 (even though the range of the selection does)
         assert_eq!(
-            state.active_rows.keys().cloned().collect::<Vec<u32>>(),
-            vec![0, 3, 5, 6]
+            state.active_rows.keys().cloned().collect::<Vec<_>>(),
+            vec![DisplayRow(0), DisplayRow(3), DisplayRow(5), DisplayRow(6)]
         );
 
         // multi-buffer support
@@ -4860,8 +5033,8 @@ mod tests {
             editor.cursor_shape = CursorShape::Block;
             editor.change_selections(None, cx, |s| {
                 s.select_display_ranges([
-                    DisplayPoint::new(4, 0)..DisplayPoint::new(7, 0),
-                    DisplayPoint::new(10, 0)..DisplayPoint::new(13, 0),
+                    DisplayPoint::new(DisplayRow(4), 0)..DisplayPoint::new(DisplayRow(7), 0),
+                    DisplayPoint::new(DisplayRow(10), 0)..DisplayPoint::new(DisplayRow(13), 0),
                 ]);
             });
         });
@@ -4877,16 +5050,22 @@ mod tests {
         // and doesn't allow selection to bleed through
         assert_eq!(
             local_selections[0].range,
-            DisplayPoint::new(4, 0)..DisplayPoint::new(6, 0)
+            DisplayPoint::new(DisplayRow(4), 0)..DisplayPoint::new(DisplayRow(6), 0)
         );
-        assert_eq!(local_selections[0].head, DisplayPoint::new(5, 0));
+        assert_eq!(
+            local_selections[0].head,
+            DisplayPoint::new(DisplayRow(5), 0)
+        );
         // moves cursor on buffer boundary back two lines
         // and doesn't allow selection to bleed through
         assert_eq!(
             local_selections[1].range,
-            DisplayPoint::new(10, 0)..DisplayPoint::new(11, 0)
+            DisplayPoint::new(DisplayRow(10), 0)..DisplayPoint::new(DisplayRow(11), 0)
         );
-        assert_eq!(local_selections[1].head, DisplayPoint::new(10, 0));
+        assert_eq!(
+            local_selections[1].head,
+            DisplayPoint::new(DisplayRow(10), 0)
+        );
     }
 
     #[gpui::test]
@@ -5138,9 +5317,16 @@ fn compute_auto_height_layout(
     max_lines: usize,
     max_line_number_width: Pixels,
     known_dimensions: Size<Option<Pixels>>,
+    available_width: AvailableSpace,
     cx: &mut ViewContext<Editor>,
 ) -> Option<Size<Pixels>> {
-    let width = known_dimensions.width?;
+    let width = known_dimensions.width.or_else(|| {
+        if let AvailableSpace::Definite(available_width) = available_width {
+            Some(available_width)
+        } else {
+            None
+        }
+    })?;
     if let Some(height) = known_dimensions.height {
         return Some(size(width, height));
     }
@@ -5169,7 +5355,7 @@ fn compute_auto_height_layout(
         snapshot = editor.snapshot(cx);
     }
 
-    let scroll_height = Pixels::from(snapshot.max_point().row() + 1) * line_height;
+    let scroll_height = Pixels::from(snapshot.max_point().row().next_row().0) * line_height;
     let height = scroll_height
         .max(line_height)
         .min(line_height * max_lines as f32);

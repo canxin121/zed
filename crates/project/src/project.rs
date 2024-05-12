@@ -69,6 +69,7 @@ use rand::prelude::*;
 use search_history::SearchHistory;
 use worktree::LocalSnapshot;
 
+use http::{HttpClient, Url};
 use rpc::{ErrorCode, ErrorExt as _};
 use search::SearchQuery;
 use serde::Serialize;
@@ -97,11 +98,9 @@ use std::{
 };
 use task::static_source::{StaticSource, TrackedFile};
 use terminals::Terminals;
-use text::{Anchor, BufferId, LineEnding, Rope};
+use text::{Anchor, BufferId, LineEnding};
 use util::{
-    debug_panic, defer,
-    http::{HttpClient, Url},
-    maybe, merge_json_value_into, parse_env_output,
+    debug_panic, defer, maybe, merge_json_value_into, parse_env_output,
     paths::{
         LOCAL_SETTINGS_RELATIVE_PATH, LOCAL_TASKS_RELATIVE_PATH, LOCAL_VSCODE_TASKS_RELATIVE_PATH,
     },
@@ -1003,7 +1002,7 @@ impl Project {
         let fs = Arc::new(RealFs::default());
         let languages = LanguageRegistry::test(cx.background_executor().clone());
         let clock = Arc::new(FakeSystemClock::default());
-        let http_client = util::http::FakeHttpClient::with_404_response();
+        let http_client = http::FakeHttpClient::with_404_response();
         let client = cx
             .update(|cx| client::Client::new(clock, http_client.clone(), cx))
             .unwrap();
@@ -1047,7 +1046,7 @@ impl Project {
 
         let languages = LanguageRegistry::test(cx.executor());
         let clock = Arc::new(FakeSystemClock::default());
-        let http_client = util::http::FakeHttpClient::with_404_response();
+        let http_client = http::FakeHttpClient::with_404_response();
         let client = cx.update(|cx| client::Client::new(clock, http_client.clone(), cx));
         let user_store = cx.new_model(|cx| UserStore::new(client.clone(), cx));
         let project = cx.update(|cx| {
@@ -2386,7 +2385,6 @@ impl Project {
 
             if let Some(language) = language {
                 for adapter in self.languages.lsp_adapters(&language) {
-                    let language_id = adapter.language_ids.get(language.name().as_ref()).cloned();
                     let server = self
                         .language_server_ids
                         .get(&(worktree_id, adapter.name.clone()))
@@ -2408,7 +2406,7 @@ impl Project {
                             lsp::DidOpenTextDocumentParams {
                                 text_document: lsp::TextDocumentItem::new(
                                     uri.clone(),
-                                    language_id.unwrap_or_default(),
+                                    adapter.language_id(&language),
                                     0,
                                     initial_snapshot.text(),
                                 ),
@@ -3741,11 +3739,7 @@ impl Project {
                     lsp::DidOpenTextDocumentParams {
                         text_document: lsp::TextDocumentItem::new(
                             uri,
-                            adapter
-                                .language_ids
-                                .get(language.name().as_ref())
-                                .cloned()
-                                .unwrap_or_default(),
+                            adapter.language_id(&language),
                             version,
                             initial_snapshot.text(),
                         ),
@@ -7564,11 +7558,7 @@ impl Project {
                                     None
                                 } else {
                                     let relative_path = path.strip_prefix(&work_directory).ok()?;
-                                    repo_entry
-                                        .repo()
-                                        .lock()
-                                        .load_index_text(relative_path)
-                                        .map(Rope::from)
+                                    repo_entry.repo().lock().load_index_text(relative_path)
                                 };
                                 Some((buffer, base_text))
                             }
@@ -7596,7 +7586,7 @@ impl Project {
                         .send(proto::UpdateDiffBase {
                             project_id,
                             buffer_id,
-                            diff_base: diff_base.map(|rope| rope.to_string()),
+                            diff_base,
                         })
                         .log_err();
                 }
@@ -7655,17 +7645,15 @@ impl Project {
                     } else {
                         let fs = self.fs.clone();
                         let task_abs_path = abs_path.clone();
+                        let tasks_file_rx =
+                            watch_config_file(&cx.background_executor(), fs, task_abs_path);
                         task_inventory.add_source(
                             TaskSourceKind::Worktree {
                                 id: remote_worktree_id,
                                 abs_path,
                                 id_base: "local_tasks_for_worktree",
                             },
-                            |cx| {
-                                let tasks_file_rx =
-                                    watch_config_file(&cx.background_executor(), fs, task_abs_path);
-                                StaticSource::new(TrackedFile::new(tasks_file_rx, cx), cx)
-                            },
+                            StaticSource::new(TrackedFile::new(tasks_file_rx, cx)),
                             cx,
                         );
                     }
@@ -7677,23 +7665,20 @@ impl Project {
                     } else {
                         let fs = self.fs.clone();
                         let task_abs_path = abs_path.clone();
+                        let tasks_file_rx =
+                            watch_config_file(&cx.background_executor(), fs, task_abs_path);
                         task_inventory.add_source(
                             TaskSourceKind::Worktree {
                                 id: remote_worktree_id,
                                 abs_path,
                                 id_base: "local_vscode_tasks_for_worktree",
                             },
-                            |cx| {
-                                let tasks_file_rx =
-                                    watch_config_file(&cx.background_executor(), fs, task_abs_path);
-                                StaticSource::new(
-                                    TrackedFile::new_convertible::<task::VsCodeTaskFile>(
-                                        tasks_file_rx,
-                                        cx,
-                                    ),
+                            StaticSource::new(
+                                TrackedFile::new_convertible::<task::VsCodeTaskFile>(
+                                    tasks_file_rx,
                                     cx,
-                                )
-                            },
+                                ),
+                            ),
                             cx,
                         );
                     }
@@ -7878,6 +7863,18 @@ impl Project {
         })
     }
 
+    pub fn project_path_for_absolute_path(
+        &self,
+        abs_path: &Path,
+        cx: &AppContext,
+    ) -> Option<ProjectPath> {
+        self.find_local_worktree(abs_path, cx)
+            .map(|(worktree, relative_path)| ProjectPath {
+                worktree_id: worktree.read(cx).id(),
+                path: relative_path.into(),
+            })
+    }
+
     pub fn get_workspace_root(
         &self,
         project_path: &ProjectPath,
@@ -7901,6 +7898,16 @@ impl Project {
             .as_local()?
             .snapshot()
             .local_git_repo(&project_path.path)
+    }
+
+    pub fn get_first_worktree_root_repo(
+        &self,
+        cx: &AppContext,
+    ) -> Option<Arc<Mutex<dyn GitRepository>>> {
+        let worktree = self.visible_worktrees(cx).next()?.read(cx).as_local()?;
+        let root_entry = worktree.root_git_entry()?;
+
+        worktree.get_local_repo(&root_entry)?.repo().clone().into()
     }
 
     pub fn blame_buffer(
@@ -8676,14 +8683,15 @@ impl Project {
         this.update(&mut cx, |this, cx| {
             let buffer_id = envelope.payload.buffer_id;
             let buffer_id = BufferId::new(buffer_id)?;
-            let diff_base = envelope.payload.diff_base.map(Rope::from);
             if let Some(buffer) = this
                 .opened_buffers
                 .get_mut(&buffer_id)
                 .and_then(|b| b.upgrade())
                 .or_else(|| this.incomplete_remote_buffers.get(&buffer_id).cloned())
             {
-                buffer.update(cx, |buffer, cx| buffer.set_diff_base(diff_base, cx));
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_diff_base(envelope.payload.diff_base, cx)
+                });
             }
             Ok(())
         })?

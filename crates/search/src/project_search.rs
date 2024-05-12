@@ -1629,15 +1629,6 @@ impl ToolbarItemView for ProjectSearchBar {
             ToolbarItemLocation::Hidden
         }
     }
-
-    fn row_count(&self, cx: &WindowContext<'_>) -> usize {
-        if let Some(search) = self.active_project_search.as_ref() {
-            if search.read(cx).filters_enabled {
-                return 2;
-            }
-        }
-        1
-    }
 }
 
 fn register_workspace_action<A: Action>(
@@ -1697,7 +1688,7 @@ fn register_workspace_action_for_present_search<A: Action>(
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use editor::DisplayPoint;
+    use editor::{display_map::DisplayRow, DisplayPoint};
     use gpui::{Action, TestAppContext, WindowHandle};
     use project::FakeFs;
     use serde_json::json;
@@ -1739,15 +1730,15 @@ pub mod tests {
                     .update(cx, |editor, cx| editor.all_text_background_highlights(cx)),
                 &[
                     (
-                        DisplayPoint::new(2, 32)..DisplayPoint::new(2, 35),
+                        DisplayPoint::new(DisplayRow(2), 32)..DisplayPoint::new(DisplayRow(2), 35),
                         match_background_color
                     ),
                     (
-                        DisplayPoint::new(2, 37)..DisplayPoint::new(2, 40),
+                        DisplayPoint::new(DisplayRow(2), 37)..DisplayPoint::new(DisplayRow(2), 40),
                         match_background_color
                     ),
                     (
-                        DisplayPoint::new(5, 6)..DisplayPoint::new(5, 9),
+                        DisplayPoint::new(DisplayRow(5), 6)..DisplayPoint::new(DisplayRow(5), 9),
                         match_background_color
                     )
                 ]
@@ -1757,7 +1748,7 @@ pub mod tests {
                 search_view
                     .results_editor
                     .update(cx, |editor, cx| editor.selections.display_ranges(cx)),
-                [DisplayPoint::new(2, 32)..DisplayPoint::new(2, 35)]
+                [DisplayPoint::new(DisplayRow(2), 32)..DisplayPoint::new(DisplayRow(2), 35)]
             );
 
             search_view.select_match(Direction::Next, cx);
@@ -1770,7 +1761,7 @@ pub mod tests {
                     search_view
                         .results_editor
                         .update(cx, |editor, cx| editor.selections.display_ranges(cx)),
-                    [DisplayPoint::new(2, 37)..DisplayPoint::new(2, 40)]
+                    [DisplayPoint::new(DisplayRow(2), 37)..DisplayPoint::new(DisplayRow(2), 40)]
                 );
                 search_view.select_match(Direction::Next, cx);
             })
@@ -1783,7 +1774,7 @@ pub mod tests {
                     search_view
                         .results_editor
                         .update(cx, |editor, cx| editor.selections.display_ranges(cx)),
-                    [DisplayPoint::new(5, 6)..DisplayPoint::new(5, 9)]
+                    [DisplayPoint::new(DisplayRow(5), 6)..DisplayPoint::new(DisplayRow(5), 9)]
                 );
                 search_view.select_match(Direction::Next, cx);
             })
@@ -1796,7 +1787,7 @@ pub mod tests {
                     search_view
                         .results_editor
                         .update(cx, |editor, cx| editor.selections.display_ranges(cx)),
-                    [DisplayPoint::new(2, 32)..DisplayPoint::new(2, 35)]
+                    [DisplayPoint::new(DisplayRow(2), 32)..DisplayPoint::new(DisplayRow(2), 35)]
                 );
                 search_view.select_match(Direction::Prev, cx);
             })
@@ -1809,7 +1800,7 @@ pub mod tests {
                     search_view
                         .results_editor
                         .update(cx, |editor, cx| editor.selections.display_ranges(cx)),
-                    [DisplayPoint::new(5, 6)..DisplayPoint::new(5, 9)]
+                    [DisplayPoint::new(DisplayRow(5), 6)..DisplayPoint::new(DisplayRow(5), 9)]
                 );
                 search_view.select_match(Direction::Prev, cx);
             })
@@ -1822,7 +1813,7 @@ pub mod tests {
                     search_view
                         .results_editor
                         .update(cx, |editor, cx| editor.selections.display_ranges(cx)),
-                    [DisplayPoint::new(2, 37)..DisplayPoint::new(2, 40)]
+                    [DisplayPoint::new(DisplayRow(2), 37)..DisplayPoint::new(DisplayRow(2), 40)]
                 );
             })
             .unwrap();

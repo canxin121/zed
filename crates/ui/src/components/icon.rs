@@ -107,6 +107,7 @@ pub enum IconName {
     CopilotError,
     CopilotInit,
     Copy,
+    CountdownTimer,
     Dash,
     Delete,
     Disconnected,
@@ -182,6 +183,7 @@ pub enum IconName {
     ZedXCopilot,
     ZedAssistant,
     PullRequest,
+    HistoryRerun,
 }
 
 impl IconName {
@@ -220,6 +222,7 @@ impl IconName {
             IconName::CopilotError => "icons/copilot_error.svg",
             IconName::CopilotInit => "icons/copilot_init.svg",
             IconName::Copy => "icons/copy.svg",
+            IconName::CountdownTimer => "icons/countdown_timer.svg",
             IconName::Dash => "icons/dash.svg",
             IconName::Delete => "icons/delete.svg",
             IconName::Disconnected => "icons/disconnected.svg",
@@ -295,6 +298,7 @@ impl IconName {
             IconName::ZedXCopilot => "icons/zed_x_copilot.svg",
             IconName::ZedAssistant => "icons/zed_assistant.svg",
             IconName::PullRequest => "icons/pull_request.svg",
+            IconName::HistoryRerun => "icons/history_rerun.svg",
         }
     }
 }

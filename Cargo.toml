@@ -265,6 +265,7 @@ bitflags = "2.4.2"
 blade-graphics = { git = "https://github.com/kvark/blade", rev = "e35b2d41f221a48b75f7cf2e78a81e7ecb7a383c" }
 blade-macros = { git = "https://github.com/kvark/blade", rev = "e35b2d41f221a48b75f7cf2e78a81e7ecb7a383c" }
 cap-std = "3.0"
+cargo_toml = "0.20"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive"] }
 clickhouse = { version = "0.11.6" }
@@ -390,7 +391,7 @@ wit-component = "0.201"
 sys-locale = "0.3.1"
 
 [workspace.dependencies.windows]
-version = "0.53.0"
+version = "0.56.0"
 features = [
     "implement",
     "Foundation_Numerics",

@@ -3,17 +3,21 @@ pub mod assistant_panel;
 pub mod assistant_settings;
 mod codegen;
 mod completion_provider;
-mod prompt_library;
+mod omit_ranges;
 mod prompts;
 mod saved_conversation;
+mod search;
+mod slash_command;
 mod streaming_diff;
 
+use ambient_context::AmbientContextSnapshot;
 pub use assistant_panel::AssistantPanel;
 use assistant_settings::{AnthropicModel, AssistantSettings, OpenAiModel, ZedDotDevModel};
 use client::{proto, Client};
 use command_palette_hooks::CommandPaletteFilter;
 pub(crate) use completion_provider::*;
 use gpui::{actions, AppContext, Global, SharedString, UpdateGlobal};
+pub(crate) use prompts::prompt_library::*;
 pub(crate) use saved_conversation::*;
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
@@ -35,6 +39,7 @@ actions!(
         InsertActivePrompt,
         ToggleIncludeConversation,
         ToggleHistory,
+        ApplyEdit
     ]
 );
 
@@ -184,6 +189,9 @@ pub struct LanguageModelChoiceDelta {
 struct MessageMetadata {
     role: Role,
     status: MessageStatus,
+    // todo!("delete this")
+    #[serde(skip)]
+    ambient_context: AmbientContextSnapshot,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

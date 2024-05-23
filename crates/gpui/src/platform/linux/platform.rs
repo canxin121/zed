@@ -34,7 +34,7 @@ use xkbcommon::xkb::{self, Keycode, Keysym, State};
 use crate::platform::linux::wayland::WaylandClient;
 use crate::{
     px, Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CosmicTextSystem, CursorStyle,
-    DisplayId, ForegroundExecutor, Keymap, Keystroke, LinuxDispatcher, Menu, Modifiers,
+    DisplayId, ForegroundExecutor, Keymap, Keystroke, LinuxDispatcher, Menu, MenuItem, Modifiers,
     PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformInputHandler, PlatformTextSystem,
     PlatformWindow, Point, PromptLevel, Result, SemanticVersion, Size, Task, WindowAppearance,
     WindowOptions, WindowParams,
@@ -55,6 +55,9 @@ pub trait LinuxClient {
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>>;
     fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn display(&self, id: DisplayId) -> Option<Rc<dyn PlatformDisplay>>;
+    fn can_open_windows(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn open_window(
         &self,
         handle: AnyWindowHandle,
@@ -130,6 +133,10 @@ impl<P: LinuxClient + 'static> Platform for P {
                 fun();
             }
         });
+    }
+
+    fn can_open_windows(&self) -> anyhow::Result<()> {
+        self.can_open_windows()
     }
 
     fn quit(&self) {
@@ -368,6 +375,7 @@ impl<P: LinuxClient + 'static> Platform for P {
 
     // todo(linux)
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap) {}
+    fn set_dock_menu(&self, menu: Vec<MenuItem>, keymap: &Keymap) {}
 
     fn local_timezone(&self) -> UtcOffset {
         UtcOffset::UTC
@@ -485,7 +493,7 @@ pub(super) fn open_uri_internal(uri: &str, activation_token: Option<&str>) {
         if let Some(token) = activation_token {
             command.env("XDG_ACTIVATION_TOKEN", token);
         }
-        match command.status() {
+        match command.spawn() {
             Ok(_) => return,
             Err(err) => last_err = Some(err),
         }

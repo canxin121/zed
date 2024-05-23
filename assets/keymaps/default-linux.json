@@ -192,6 +192,12 @@
     }
   },
   {
+    "context": "Markdown",
+    "bindings": {
+      "ctrl-c": "markdown::Copy"
+    }
+  },
+  {
     "context": "AssistantPanel",
     "bindings": {
       "ctrl-g": "search::SelectNextMatch",
@@ -493,6 +499,12 @@
     "bindings": {
       "enter": "editor::ConfirmCompletion",
       "tab": "editor::ConfirmCompletion"
+    }
+  },
+  {
+    "context": "Editor && inline_completion && !showing_completions",
+    "bindings": {
+      "tab": "editor::AcceptInlineCompletion"
     }
   },
   {

@@ -10,8 +10,8 @@ use client::ZED_URL_SCHEME;
 use collections::VecDeque;
 use editor::{scroll::Autoscroll, Editor, MultiBuffer};
 use gpui::{
-    actions, point, px, AppContext, AsyncAppContext, Context, FocusableView, PromptLevel,
-    TitlebarOptions, View, ViewContext, VisualContext, WindowKind, WindowOptions,
+    actions, point, px, AppContext, AsyncAppContext, Context, FocusableView, MenuItem, PromptLevel,
+    ReadGlobal, TitlebarOptions, View, ViewContext, VisualContext, WindowKind, WindowOptions,
 };
 pub use open_listener::*;
 
@@ -214,8 +214,24 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut AppContext) {
             workspace_handle.update(&mut cx, |workspace, cx| {
                 workspace.add_panel(assistant_panel, cx);
                 workspace.add_panel(project_panel, cx);
-                if !workspace.project().read(cx).is_remote() {
-                    workspace.add_panel(terminal_panel, cx);
+                {
+                    let project = workspace.project().read(cx);
+                    if project.is_local()
+                        || project
+                            .dev_server_project_id()
+                            .and_then(|dev_server_project_id| {
+                                Some(
+                                    dev_server_projects::Store::global(cx)
+                                        .read(cx)
+                                        .dev_server_for_project(dev_server_project_id)?
+                                        .ssh_connection_string
+                                        .is_some(),
+                                )
+                            })
+                            .unwrap_or(false)
+                    {
+                        workspace.add_panel(terminal_panel, cx);
+                    }
                 }
                 workspace.add_panel(channels_panel, cx);
                 workspace.add_panel(chat_panel, cx);
@@ -654,6 +670,7 @@ fn reload_keymaps(cx: &mut AppContext, keymap_content: &KeymapFile) {
     load_default_keymap(cx);
     keymap_content.clone().add_to_cx(cx).log_err();
     cx.set_menus(app_menus());
+    cx.set_dock_menu(vec![MenuItem::action("New Window", workspace::NewWindow)])
 }
 
 pub fn load_default_keymap(cx: &mut AppContext) {

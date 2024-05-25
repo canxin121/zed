@@ -5,10 +5,11 @@ pub mod static_source;
 mod task_template;
 mod vscode_format;
 
-use collections::{HashMap, HashSet};
+use collections::{hash_map, HashMap, HashSet};
 use gpui::SharedString;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::{borrow::Cow, path::Path};
 
 pub use task_template::{RevealStrategy, TaskTemplate, TaskTemplates};
@@ -124,6 +125,14 @@ impl ResolvedTask {
 pub enum VariableName {
     /// An absolute path of the currently opened file.
     File,
+    /// A path of the currently opened file (relative to worktree root).
+    RelativeFile,
+    /// The currently opened filename.
+    Filename,
+    /// The path to a parent directory of a currently opened file.
+    Dirname,
+    /// Stem (filename without extension) of the currently opened file.
+    Stem,
     /// An absolute path of the currently opened worktree, that contains the file.
     WorktreeRoot,
     /// A symbol text, that contains latest cursor/selection position.
@@ -153,20 +162,54 @@ impl VariableName {
     }
 }
 
+impl FromStr for VariableName {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let without_prefix = s.strip_prefix(ZED_VARIABLE_NAME_PREFIX).ok_or(())?;
+        let value = match without_prefix {
+            "FILE" => Self::File,
+            "WORKTREE_ROOT" => Self::WorktreeRoot,
+            "SYMBOL" => Self::Symbol,
+            "SELECTED_TEXT" => Self::SelectedText,
+            "ROW" => Self::Row,
+            "COLUMN" => Self::Column,
+            _ => {
+                if let Some(custom_name) =
+                    without_prefix.strip_prefix(ZED_CUSTOM_VARIABLE_NAME_PREFIX)
+                {
+                    Self::Custom(Cow::Owned(custom_name.to_owned()))
+                } else {
+                    return Err(());
+                }
+            }
+        };
+        Ok(value)
+    }
+}
+
 /// A prefix that all [`VariableName`] variants are prefixed with when used in environment variables and similar template contexts.
 pub const ZED_VARIABLE_NAME_PREFIX: &str = "ZED_";
+const ZED_CUSTOM_VARIABLE_NAME_PREFIX: &str = "CUSTOM_";
 
 impl std::fmt::Display for VariableName {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::File => write!(f, "{ZED_VARIABLE_NAME_PREFIX}FILE"),
+            Self::Filename => write!(f, "{ZED_VARIABLE_NAME_PREFIX}FILENAME"),
+            Self::RelativeFile => write!(f, "{ZED_VARIABLE_NAME_PREFIX}RELATIVE_FILE"),
+            Self::Dirname => write!(f, "{ZED_VARIABLE_NAME_PREFIX}DIRNAME"),
+            Self::Stem => write!(f, "{ZED_VARIABLE_NAME_PREFIX}STEM"),
             Self::WorktreeRoot => write!(f, "{ZED_VARIABLE_NAME_PREFIX}WORKTREE_ROOT"),
             Self::Symbol => write!(f, "{ZED_VARIABLE_NAME_PREFIX}SYMBOL"),
             Self::Row => write!(f, "{ZED_VARIABLE_NAME_PREFIX}ROW"),
             Self::Column => write!(f, "{ZED_VARIABLE_NAME_PREFIX}COLUMN"),
             Self::SelectedText => write!(f, "{ZED_VARIABLE_NAME_PREFIX}SELECTED_TEXT"),
             Self::RunnableSymbol => write!(f, "{ZED_VARIABLE_NAME_PREFIX}RUNNABLE_SYMBOL"),
-            Self::Custom(s) => write!(f, "{ZED_VARIABLE_NAME_PREFIX}CUSTOM_{s}"),
+            Self::Custom(s) => write!(
+                f,
+                "{ZED_VARIABLE_NAME_PREFIX}{ZED_CUSTOM_VARIABLE_NAME_PREFIX}{s}"
+            ),
         }
     }
 }
@@ -204,6 +247,16 @@ impl TaskVariables {
 impl FromIterator<(VariableName, String)> for TaskVariables {
     fn from_iter<T: IntoIterator<Item = (VariableName, String)>>(iter: T) -> Self {
         Self(HashMap::from_iter(iter))
+    }
+}
+
+impl IntoIterator for TaskVariables {
+    type Item = (VariableName, String);
+
+    type IntoIter = hash_map::IntoIter<VariableName, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
     }
 }
 

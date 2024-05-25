@@ -20,5 +20,5 @@ jobs:
       - name: Upload files
         uses: actions/upload-artifact@v4
         with:
-          name: AppRhyme-release-amd64
+          name: Zed
           path: target/release/Zed.exe

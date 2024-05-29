@@ -72,7 +72,7 @@ pub use language_registry::{
 pub use lsp::LanguageServerId;
 pub use outline::{Outline, OutlineItem};
 pub use syntax_map::{OwnedSyntaxLayer, SyntaxLayer};
-pub use text::LineEnding;
+pub use text::{AnchorRangeExt, LineEnding};
 pub use tree_sitter::{Node, Parser, Tree, TreeCursor};
 
 /// Initializes the `language` crate.
@@ -535,7 +535,7 @@ async fn try_fetch_server_binary<L: LspAdapter + 'static + Send + Sync + ?Sized>
     binary
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CodeLabel {
     /// The text to display.
     pub text: String,
@@ -1539,6 +1539,15 @@ impl CodeLabel {
             }
         }
         result
+    }
+
+    pub fn push_str(&mut self, text: &str, highlight: Option<HighlightId>) {
+        let start_ix = self.text.len();
+        self.text.push_str(text);
+        let end_ix = self.text.len();
+        if let Some(highlight) = highlight {
+            self.runs.push((start_ix..end_ix, highlight));
+        }
     }
 }
 

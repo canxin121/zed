@@ -7,7 +7,7 @@ mod vscode_format;
 
 use collections::{hash_map, HashMap, HashSet};
 use gpui::SharedString;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::{borrow::Cow, path::Path};
@@ -17,7 +17,7 @@ pub use vscode_format::VsCodeTaskFile;
 
 /// Task identifier, unique within the application.
 /// Based on it, task reruns and terminal tabs are managed.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct TaskId(pub String);
 
 /// TerminalWorkDir describes where a task should be run
@@ -121,6 +121,9 @@ impl ResolvedTask {
 }
 
 /// Variables, available for use in [`TaskContext`] when a Zed's [`TaskTemplate`] gets resolved into a [`ResolvedTask`].
+/// Name of the variable must be a valid shell variable identifier, which generally means that it is
+/// a word  consisting only  of alphanumeric characters and underscores,
+/// and beginning with an alphabetic character or an  underscore.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub enum VariableName {
     /// An absolute path of the currently opened file.
@@ -146,19 +149,14 @@ pub enum VariableName {
     /// The symbol selected by the symbol tagging system, specifically the @run capture in a runnables.scm
     RunnableSymbol,
     /// Custom variable, provided by the plugin or other external source.
-    /// Will be printed with `ZED_` prefix to avoid potential conflicts with other variables.
+    /// Will be printed with `CUSTOM_` prefix to avoid potential conflicts with other variables.
     Custom(Cow<'static, str>),
 }
 
 impl VariableName {
     /// Generates a `$VARIABLE`-like string value to be used in templates.
-    /// Custom variables are wrapped in `${}` to avoid substitution issues with whitespaces.
     pub fn template_value(&self) -> String {
-        if matches!(self, Self::Custom(_)) {
-            format!("${{{self}}}")
-        } else {
-            format!("${self}")
-        }
+        format!("${self}")
     }
 }
 

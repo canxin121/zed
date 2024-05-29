@@ -305,6 +305,7 @@ impl MessageEditor {
                     documentation: None,
                     server_id: LanguageServerId(0), // TODO: Make this optional or something?
                     lsp_completion: Default::default(), // TODO: Make this optional or something?
+                    confirm: None,
                 }
             })
             .collect()
@@ -524,7 +525,7 @@ impl Render for MessageEditor {
             font_family: settings.ui_font.family.clone(),
             font_features: settings.ui_font.features.clone(),
             font_size: TextSize::Small.rems(cx).into(),
-            font_weight: FontWeight::NORMAL,
+            font_weight: settings.ui_font.weight,
             font_style: FontStyle::Normal,
             line_height: relative(1.3),
             background_color: None,

@@ -509,7 +509,7 @@ impl Client {
         let credentials_provider: Arc<dyn CredentialsProvider + Send + Sync + 'static> =
             if use_zed_development_auth {
                 Arc::new(DevelopmentCredentialsProvider {
-                    path: util::paths::CONFIG_DIR.join("development_auth"),
+                    path: paths::config_dir().join("development_auth"),
                 })
             } else {
                 Arc::new(KeychainCredentialsProvider)
@@ -1729,6 +1729,7 @@ mod tests {
     use gpui::{BackgroundExecutor, Context, TestAppContext};
     use http::FakeHttpClient;
     use parking_lot::Mutex;
+    use proto::TypedEnvelope;
     use settings::SettingsStore;
     use std::future;
 

@@ -1,5 +1,5 @@
 [package]
-name = "color"
+name = "paths"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -8,12 +8,9 @@ license = "GPL-3.0-or-later"
 [lints]
 workspace = true
 
-[features]
-default = []
-
 [lib]
-path = "src/color.rs"
-doctest = true
+path = "src/paths.rs"
 
 [dependencies]
-palette.workspace = true
+dirs.workspace = true
+util.workspace = true

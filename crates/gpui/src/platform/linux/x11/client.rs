@@ -5,13 +5,11 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use calloop::generic::{FdWrapper, Generic};
-use calloop::{channel, EventLoop, LoopHandle, RegistrationToken};
+use calloop::{EventLoop, LoopHandle, RegistrationToken};
 
 use collections::HashMap;
-use copypasta::x11_clipboard::{Clipboard, Primary, X11ClipboardContext};
-use copypasta::ClipboardProvider;
-
 use util::ResultExt;
+
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::cursor;
 use x11rb::errors::ConnectionError;
@@ -129,8 +127,7 @@ pub struct X11ClientState {
     pub(crate) scroll_y: Option<f32>,
 
     pub(crate) common: LinuxCommon,
-    pub(crate) clipboard: X11ClipboardContext<Clipboard>,
-    pub(crate) primary: X11ClipboardContext<Primary>,
+    pub(crate) clipboard: x11_clipboard::Clipboard,
 }
 
 #[derive(Clone)]
@@ -165,9 +162,17 @@ impl X11Client {
         let handle = event_loop.handle();
 
         handle
-            .insert_source(main_receiver, |event, _, _: &mut X11Client| {
-                if let calloop::channel::Event::Msg(runnable) = event {
-                    runnable.run();
+            .insert_source(main_receiver, {
+                let handle = handle.clone();
+                move |event, _, _: &mut X11Client| {
+                    if let calloop::channel::Event::Msg(runnable) = event {
+                        // Insert the runnables as idle callbacks, so we make sure that user-input and X11
+                        // events have higher priority and runnables are only worked off after the event
+                        // callbacks.
+                        handle.insert_idle(|_| {
+                            runnable.run();
+                        });
+                    }
                 }
             })
             .unwrap();
@@ -269,16 +274,13 @@ impl X11Client {
             .reply()
             .unwrap();
 
-        let clipboard = X11ClipboardContext::<Clipboard>::new().unwrap();
-        let primary = X11ClipboardContext::<Primary>::new().unwrap();
+        let clipboard = x11_clipboard::Clipboard::new().unwrap();
 
         let xcb_connection = Rc::new(xcb_connection);
 
-        let (xim_tx, xim_rx) = channel::channel::<XimCallbackEvent>();
-
         let ximc = X11rbClient::init(Rc::clone(&xcb_connection), x_root_index, None).ok();
         let xim_handler = if ximc.is_some() {
-            Some(XimHandler::new(xim_tx))
+            Some(XimHandler::new())
         } else {
             None
         };
@@ -303,10 +305,12 @@ impl X11Client {
                                 client.handle_event(event);
                                 continue;
                             }
+
                             let mut ximc = state.ximc.take().unwrap();
                             let mut xim_handler = state.xim_handler.take().unwrap();
                             let xim_connected = xim_handler.connected;
                             drop(state);
+
                             let xim_filtered = match ximc.filter_event(&event, &mut xim_handler) {
                                 Ok(handled) => handled,
                                 Err(err) => {
@@ -314,46 +318,34 @@ impl X11Client {
                                     false
                                 }
                             };
+                            let xim_callback_event = xim_handler.last_callback_event.take();
+
                             let mut state = client.0.borrow_mut();
                             state.ximc = Some(ximc);
                             state.xim_handler = Some(xim_handler);
                             drop(state);
+
+                            if let Some(event) = xim_callback_event {
+                                client.handle_xim_callback_event(event);
+                            }
+
                             if xim_filtered {
                                 continue;
                             }
+
                             if xim_connected {
                                 client.xim_handle_event(event);
                             } else {
                                 client.handle_event(event);
                             }
                         }
+
                         Ok(calloop::PostAction::Continue)
                     }
                 },
             )
             .expect("Failed to initialize x11 event source");
-        handle
-            .insert_source(xim_rx, {
-                move |chan_event, _, client| match chan_event {
-                    channel::Event::Msg(xim_event) => {
-                        match xim_event {
-                            XimCallbackEvent::XimXEvent(event) => {
-                                client.handle_event(event);
-                            }
-                            XimCallbackEvent::XimCommitEvent(window, text) => {
-                                client.xim_handle_commit(window, text);
-                            }
-                            XimCallbackEvent::XimPreeditEvent(window, text) => {
-                                client.xim_handle_preedit(window, text);
-                            }
-                        };
-                    }
-                    channel::Event::Closed => {
-                        log::error!("XIM Event Sender dropped")
-                    }
-                }
-            })
-            .expect("Failed to initialize XIM event source");
+
         handle
             .insert_source(XDPEventSource::new(&common.background_executor), {
                 move |event, _, client| match event {
@@ -362,6 +354,9 @@ impl X11Client {
                         for (_, window) in &mut client.0.borrow_mut().windows {
                             window.window.set_appearance(appearance);
                         }
+                    }
+                    XDPEvent::CursorTheme(_) | XDPEvent::CursorSize(_) => {
+                        // noop, X11 manages this for us.
                     }
                 }
             })
@@ -400,7 +395,6 @@ impl X11Client {
             scroll_y: None,
 
             clipboard,
-            primary,
         })))
     }
 
@@ -462,6 +456,7 @@ impl X11Client {
         state
             .windows
             .get(&win)
+            .filter(|window_reference| !window_reference.window.state.borrow().destroyed)
             .map(|window_reference| window_reference.window.clone())
     }
 
@@ -475,9 +470,8 @@ impl X11Client {
                 if atom == state.atoms.WM_DELETE_WINDOW {
                     // window "x" button clicked by user
                     if window.should_close() {
-                        let window_ref = state.windows.remove(&event.window)?;
-                        state.loop_handle.remove(window_ref.refresh_event_token);
                         // Rest of the close logic is handled in drop_window()
+                        window.close();
                     }
                 }
             }
@@ -528,15 +522,20 @@ impl X11Client {
                     0,
                     event.locked_group.into(),
                 );
-                let modifiers = Modifiers::from_xkb(&state.xkb);
-                let focused_window_id = state.focused_window?;
-                state.modifiers = modifiers;
-                drop(state);
 
-                let focused_window = self.get_window(focused_window_id)?;
-                focused_window.handle_input(PlatformInput::ModifiersChanged(
-                    ModifiersChangedEvent { modifiers },
-                ));
+                let modifiers = Modifiers::from_xkb(&state.xkb);
+                if state.modifiers == modifiers {
+                    drop(state);
+                } else {
+                    let focused_window_id = state.focused_window?;
+                    state.modifiers = modifiers;
+                    drop(state);
+
+                    let focused_window = self.get_window(focused_window_id)?;
+                    focused_window.handle_input(PlatformInput::ModifiersChanged(
+                        ModifiersChangedEvent { modifiers },
+                    ));
+                }
             }
             Event::KeyPress(event) => {
                 let window = self.get_window(event.event)?;
@@ -793,6 +792,20 @@ impl X11Client {
         Some(())
     }
 
+    fn handle_xim_callback_event(&self, event: XimCallbackEvent) {
+        match event {
+            XimCallbackEvent::XimXEvent(event) => {
+                self.handle_event(event);
+            }
+            XimCallbackEvent::XimCommitEvent(window, text) => {
+                self.xim_handle_commit(window, text);
+            }
+            XimCallbackEvent::XimPreeditEvent(window, text) => {
+                self.xim_handle_preedit(window, text);
+            }
+        };
+    }
+
     fn xim_handle_event(&self, event: Event) -> Option<()> {
         match event {
             Event::KeyPress(event) | Event::KeyRelease(event) => {
@@ -873,6 +886,10 @@ impl X11Client {
 }
 
 impl LinuxClient for X11Client {
+    fn compositor_name(&self) -> &'static str {
+        "X11"
+    }
+
     fn with_common<R>(&self, f: impl FnOnce(&mut LinuxCommon) -> R) -> R {
         f(&mut self.0.borrow_mut().common)
     }
@@ -885,8 +902,11 @@ impl LinuxClient for X11Client {
             .iter()
             .enumerate()
             .filter_map(|(root_id, _)| {
-                Some(Rc::new(X11Display::new(&state.xcb_connection, root_id)?)
-                    as Rc<dyn PlatformDisplay>)
+                Some(Rc::new(X11Display::new(
+                    &state.xcb_connection,
+                    state.scale_factor,
+                    root_id,
+                )?) as Rc<dyn PlatformDisplay>)
             })
             .collect()
     }
@@ -895,8 +915,12 @@ impl LinuxClient for X11Client {
         let state = self.0.borrow();
 
         Some(Rc::new(
-            X11Display::new(&state.xcb_connection, state.x_root_index)
-                .expect("There should always be a root index"),
+            X11Display::new(
+                &state.xcb_connection,
+                state.scale_factor,
+                state.x_root_index,
+            )
+            .expect("There should always be a root index"),
         ))
     }
 
@@ -905,6 +929,7 @@ impl LinuxClient for X11Client {
 
         Some(Rc::new(X11Display::new(
             &state.xcb_connection,
+            state.scale_factor,
             id.0 as usize,
         )?))
     }
@@ -913,7 +938,7 @@ impl LinuxClient for X11Client {
         &self,
         handle: AnyWindowHandle,
         params: WindowParams,
-    ) -> Box<dyn PlatformWindow> {
+    ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         let mut state = self.0.borrow_mut();
         let x_window = state.xcb_connection.generate_id().unwrap();
 
@@ -928,7 +953,7 @@ impl LinuxClient for X11Client {
             &state.atoms,
             state.scale_factor,
             state.common.appearance,
-        );
+        )?;
 
         let screen_resources = state
             .xcb_connection
@@ -996,7 +1021,7 @@ impl LinuxClient for X11Client {
         };
 
         state.windows.insert(x_window, window_ref);
-        Box::new(window)
+        Ok(Box::new(window))
     }
 
     fn set_cursor_style(&self, style: CursorStyle) {
@@ -1042,35 +1067,61 @@ impl LinuxClient for X11Client {
     }
 
     fn write_to_primary(&self, item: crate::ClipboardItem) {
-        self.0.borrow_mut().primary.set_contents(item.text).ok();
+        let state = self.0.borrow_mut();
+        state
+            .clipboard
+            .store(
+                state.clipboard.setter.atoms.primary,
+                state.clipboard.setter.atoms.utf8_string,
+                item.text().as_bytes(),
+            )
+            .ok();
     }
 
     fn write_to_clipboard(&self, item: crate::ClipboardItem) {
-        self.0.borrow_mut().clipboard.set_contents(item.text).ok();
+        let state = self.0.borrow_mut();
+        state
+            .clipboard
+            .store(
+                state.clipboard.setter.atoms.clipboard,
+                state.clipboard.setter.atoms.utf8_string,
+                item.text().as_bytes(),
+            )
+            .ok();
     }
 
     fn read_from_primary(&self) -> Option<crate::ClipboardItem> {
-        self.0
-            .borrow_mut()
-            .primary
-            .get_contents()
-            .ok()
+        let state = self.0.borrow_mut();
+        state
+            .clipboard
+            .load(
+                state.clipboard.getter.atoms.primary,
+                state.clipboard.getter.atoms.utf8_string,
+                state.clipboard.getter.atoms.property,
+                Duration::from_secs(3),
+            )
             .map(|text| crate::ClipboardItem {
-                text,
+                text: String::from_utf8(text).unwrap(),
                 metadata: None,
             })
+            .ok()
     }
 
     fn read_from_clipboard(&self) -> Option<crate::ClipboardItem> {
-        self.0
-            .borrow_mut()
+        let state = self.0.borrow_mut();
+        state
             .clipboard
-            .get_contents()
-            .ok()
+            .load(
+                state.clipboard.getter.atoms.clipboard,
+                state.clipboard.getter.atoms.utf8_string,
+                state.clipboard.getter.atoms.property,
+                Duration::from_secs(3),
+            )
             .map(|text| crate::ClipboardItem {
-                text,
+                text: String::from_utf8(text).unwrap(),
                 metadata: None,
             })
+            .ok()
     }
 
     fn run(&self) {

@@ -19,7 +19,7 @@ use client::{
     TypedEnvelope, UserStore,
 };
 use clock::ReplicaId;
-use collections::{hash_map, BTreeMap, HashMap, HashSet, VecDeque};
+use collections::{btree_map, hash_map, BTreeMap, HashMap, HashSet, VecDeque};
 use debounced_delay::DebouncedDelay;
 use futures::{
     channel::{
@@ -42,7 +42,9 @@ use gpui::{
 use http::{HttpClient, Url};
 use itertools::Itertools;
 use language::{
-    language_settings::{language_settings, FormatOnSave, Formatter, InlayHintKind},
+    language_settings::{
+        language_settings, AllLanguageSettings, FormatOnSave, Formatter, InlayHintKind,
+    },
     markdown, point_to_lsp, prepare_completion_documentation,
     proto::{
         deserialize_anchor, deserialize_line_ending, deserialize_version, serialize_anchor,
@@ -56,14 +58,18 @@ use language::{
 };
 use log::error;
 use lsp::{
-    DiagnosticSeverity, DiagnosticTag, DidChangeWatchedFilesRegistrationOptions,
-    DocumentHighlightKind, Edit, FileSystemWatcher, LanguageServer, LanguageServerBinary,
-    LanguageServerId, LspRequestFuture, MessageActionItem, OneOf, ServerCapabilities,
-    ServerHealthStatus, ServerStatus, TextEdit,
+    CompletionContext, DiagnosticSeverity, DiagnosticTag, DidChangeWatchedFilesRegistrationOptions,
+    DocumentHighlightKind, Edit, FileSystemWatcher, InsertTextFormat, LanguageServer,
+    LanguageServerBinary, LanguageServerId, LspRequestFuture, MessageActionItem, OneOf,
+    ServerCapabilities, ServerHealthStatus, ServerStatus, TextEdit, WorkDoneProgressCancelParams,
 };
 use lsp_command::*;
 use node_runtime::NodeRuntime;
 use parking_lot::{Mutex, RwLock};
+use paths::{
+    local_settings_file_relative_path, local_tasks_file_relative_path,
+    local_vscode_tasks_file_relative_path,
+};
 use postage::watch;
 use prettier_support::{DefaultPrettier, PrettierInstance};
 use project_settings::{LspSettings, ProjectSettings};
@@ -103,12 +109,10 @@ use task::{
 };
 use terminals::Terminals;
 use text::{Anchor, BufferId, LineEnding};
+use unicase::UniCase;
 use util::{
-    debug_panic, defer, maybe, merge_json_value_into, parse_env_output,
-    paths::{
-        LOCAL_SETTINGS_RELATIVE_PATH, LOCAL_TASKS_RELATIVE_PATH, LOCAL_VSCODE_TASKS_RELATIVE_PATH,
-    },
-    post_inc, ResultExt, TryFutureExt as _,
+    debug_panic, defer, maybe, merge_json_value_into, parse_env_output, post_inc,
+    NumericPrefixWithSuffix, ResultExt, TryFutureExt as _,
 };
 use worktree::{CreatedEntry, RemoteWorktreeClient, Snapshot, Traversal};
 
@@ -128,7 +132,7 @@ pub use worktree::{
 const MAX_SERVER_REINSTALL_ATTEMPT_COUNT: u64 = 4;
 const SERVER_REINSTALL_DEBOUNCE_TIMEOUT: Duration = Duration::from_secs(1);
 const SERVER_LAUNCHING_BEFORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-pub const SERVER_PROGRESS_DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(100);
+pub const SERVER_PROGRESS_THROTTLE_TIMEOUT: Duration = Duration::from_millis(100);
 
 const MAX_PROJECT_SEARCH_HISTORY_SIZE: usize = 500;
 
@@ -161,9 +165,6 @@ pub struct Project {
     worktrees_reordered: bool,
     active_entry: Option<ProjectEntryId>,
     buffer_ordered_messages_tx: mpsc::UnboundedSender<BufferOrderedMessage>,
-    pending_language_server_update: Option<BufferOrderedMessage>,
-    flush_language_server_update: Option<Task<()>>,
-
     languages: Arc<LanguageRegistry>,
     supplementary_language_servers:
         HashMap<LanguageServerId, (LanguageServerName, Arc<LanguageServer>)>,
@@ -228,7 +229,6 @@ pub struct Project {
     hosted_project_id: Option<ProjectId>,
     dev_server_project_id: Option<client::DevServerProjectId>,
     search_history: SearchHistory,
-    yarn_worktree_ids_reported: Vec<WorktreeId>,
 }
 
 pub enum LanguageServerToQuery {
@@ -379,6 +379,9 @@ pub struct LanguageServerStatus {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct LanguageServerProgress {
+    pub is_disk_based_diagnostics_progress: bool,
+    pub is_cancellable: bool,
+    pub title: Option<String>,
     pub message: Option<String>,
     pub percentage: Option<usize>,
     #[serde(skip_serializing)]
@@ -618,27 +621,9 @@ enum SearchMatchCandidate {
     Path {
         worktree_id: WorktreeId,
         is_ignored: bool,
+        is_file: bool,
         path: Arc<Path>,
     },
-}
-
-impl SearchMatchCandidate {
-    fn path(&self) -> Option<Arc<Path>> {
-        match self {
-            SearchMatchCandidate::OpenBuffer { path, .. } => path.clone(),
-            SearchMatchCandidate::Path { path, .. } => Some(path.clone()),
-        }
-    }
-
-    fn is_ignored(&self) -> bool {
-        matches!(
-            self,
-            SearchMatchCandidate::Path {
-                is_ignored: true,
-                ..
-            }
-        )
-    }
 }
 
 pub enum SearchResult {
@@ -648,6 +633,12 @@ pub enum SearchResult {
     },
     LimitReached,
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub const DEFAULT_COMPLETION_CONTEXT: CompletionContext = CompletionContext {
+    trigger_kind: lsp::CompletionTriggerKind::INVOKED,
+    trigger_character: None,
+};
 
 impl Project {
     pub fn init_settings(cx: &mut AppContext) {
@@ -712,6 +703,7 @@ impl Project {
         client.add_model_request_handler(Self::handle_restart_language_servers);
         client.add_model_request_handler(Self::handle_task_context_for_location);
         client.add_model_request_handler(Self::handle_task_templates);
+        client.add_model_request_handler(Self::handle_lsp_command::<LinkedEditingRange>);
     }
 
     pub fn local(
@@ -732,8 +724,6 @@ impl Project {
                 worktrees: Vec::new(),
                 worktrees_reordered: false,
                 buffer_ordered_messages_tx: tx,
-                flush_language_server_update: None,
-                pending_language_server_update: None,
                 collaborators: Default::default(),
                 opened_buffers: Default::default(),
                 shared_buffers: Default::default(),
@@ -787,7 +777,6 @@ impl Project {
                 hosted_project_id: None,
                 dev_server_project_id: None,
                 search_history: Self::new_search_history(),
-                yarn_worktree_ids_reported: Vec::new(),
             }
         })
     }
@@ -874,8 +863,6 @@ impl Project {
                 worktrees: Vec::new(),
                 worktrees_reordered: false,
                 buffer_ordered_messages_tx: tx,
-                pending_language_server_update: None,
-                flush_language_server_update: None,
                 loading_buffers_by_path: Default::default(),
                 loading_buffers: Default::default(),
                 shared_buffers: Default::default(),
@@ -952,7 +939,6 @@ impl Project {
                     .dev_server_project_id
                     .map(|dev_server_project_id| DevServerProjectId(dev_server_project_id)),
                 search_history: Self::new_search_history(),
-                yarn_worktree_ids_reported: Vec::new(),
             };
             this.set_role(role, cx);
             for worktree in worktrees {
@@ -1816,6 +1802,9 @@ impl Project {
     }
 
     pub fn disconnected_from_host(&mut self, cx: &mut ModelContext<Self>) {
+        if self.is_disconnected() {
+            return;
+        }
         self.disconnected_from_host_internal(cx);
         cx.emit(Event::DisconnectedFromHost);
         cx.notify();
@@ -1863,7 +1852,10 @@ impl Project {
             for open_buffer in self.opened_buffers.values_mut() {
                 // Wake up any tasks waiting for peers' edits to this buffer.
                 if let Some(buffer) = open_buffer.upgrade() {
-                    buffer.update(cx, |buffer, _| buffer.give_up_waiting());
+                    buffer.update(cx, |buffer, cx| {
+                        buffer.give_up_waiting();
+                        buffer.set_capability(Capability::ReadOnly, cx)
+                    });
                 }
 
                 if let OpenBuffer::Strong(buffer) = open_buffer {
@@ -2127,6 +2119,9 @@ impl Project {
         let remote_worktree_id = worktree.read(cx).id();
         let path = path.clone();
         let path_string = path.to_string_lossy().to_string();
+        if self.is_disconnected() {
+            return Task::ready(Err(anyhow!(ErrorCode::Disconnected)));
+        }
         cx.spawn(move |this, mut cx| async move {
             let response = rpc
                 .request(proto::OpenBufferByPath {
@@ -2484,8 +2479,9 @@ impl Project {
             }
 
             let abs_path = file.abs_path(cx);
-            let uri = lsp::Url::from_file_path(&abs_path)
-                .unwrap_or_else(|()| panic!("Failed to register file {abs_path:?}"));
+            let Some(uri) = lsp::Url::from_file_path(&abs_path).log_err() else {
+                return;
+            };
             let initial_snapshot = buffer.text_snapshot();
             let language = buffer.language().cloned();
             let worktree_id = file.worktree_id(cx);
@@ -4139,6 +4135,54 @@ impl Project {
         .detach();
     }
 
+    pub fn cancel_language_server_work_for_buffers(
+        &mut self,
+        buffers: impl IntoIterator<Item = Model<Buffer>>,
+        cx: &mut ModelContext<Self>,
+    ) {
+        let servers = buffers
+            .into_iter()
+            .flat_map(|buffer| {
+                self.language_server_ids_for_buffer(buffer.read(cx), cx)
+                    .into_iter()
+            })
+            .collect::<HashSet<_>>();
+
+        for server_id in servers {
+            self.cancel_language_server_work(server_id, None, cx);
+        }
+    }
+
+    pub fn cancel_language_server_work(
+        &mut self,
+        server_id: LanguageServerId,
+        token_to_cancel: Option<String>,
+        _cx: &mut ModelContext<Self>,
+    ) {
+        let status = self.language_server_statuses.get(&server_id);
+        let server = self.language_servers.get(&server_id);
+        if let Some((server, status)) = server.zip(status) {
+            if let LanguageServerState::Running { server, .. } = server {
+                for (token, progress) in &status.pending_work {
+                    if let Some(token_to_cancel) = token_to_cancel.as_ref() {
+                        if token != token_to_cancel {
+                            continue;
+                        }
+                    }
+                    if progress.is_cancellable {
+                        server
+                            .notify::<lsp::notification::WorkDoneProgressCancel>(
+                                WorkDoneProgressCancelParams {
+                                    token: lsp::NumberOrString::String(token.clone()),
+                                },
+                            )
+                            .ok();
+                    }
+                }
+            }
+        }
+    }
+
     fn check_errored_server(
         language: Arc<Language>,
         adapter: Arc<CachedLspAdapter>,
@@ -4208,35 +4252,7 @@ impl Project {
         .detach();
     }
 
-    fn enqueue_language_server_progress(
-        &mut self,
-        message: BufferOrderedMessage,
-        cx: &mut ModelContext<Self>,
-    ) {
-        self.pending_language_server_update.replace(message);
-        self.flush_language_server_update.get_or_insert_with(|| {
-            cx.spawn(|this, mut cx| async move {
-                cx.background_executor()
-                    .timer(SERVER_PROGRESS_DEBOUNCE_TIMEOUT)
-                    .await;
-                this.update(&mut cx, |this, _| {
-                    this.flush_language_server_update.take();
-                    if let Some(update) = this.pending_language_server_update.take() {
-                        this.enqueue_buffer_ordered_message(update).ok();
-                    }
-                })
-                .ok();
-            })
-        });
-    }
-
     fn enqueue_buffer_ordered_message(&mut self, message: BufferOrderedMessage) -> Result<()> {
-        if let Some(pending_message) = self.pending_language_server_update.take() {
-            self.flush_language_server_update.take();
-            self.buffer_ordered_messages_tx
-                .unbounded_send(pending_message)
-                .map_err(|e| anyhow!(e))?;
-        }
         self.buffer_ordered_messages_tx
             .unbounded_send(message)
             .map_err(|e| anyhow!(e))
@@ -4256,6 +4272,7 @@ impl Project {
                 return;
             }
         };
+
         let lsp::ProgressParamsValue::WorkDone(progress) = progress.value;
         let language_server_status =
             if let Some(status) = self.language_server_statuses.get_mut(&language_server_id) {
@@ -4278,32 +4295,36 @@ impl Project {
             lsp::WorkDoneProgress::Begin(report) => {
                 if is_disk_based_diagnostics_progress {
                     self.disk_based_diagnostics_started(language_server_id, cx);
-                } else {
-                    self.on_lsp_work_start(
-                        language_server_id,
-                        token.clone(),
-                        LanguageServerProgress {
-                            message: report.message.clone(),
-                            percentage: report.percentage.map(|p| p as usize),
-                            last_update_at: Instant::now(),
-                        },
-                        cx,
-                    );
                 }
+                self.on_lsp_work_start(
+                    language_server_id,
+                    token.clone(),
+                    LanguageServerProgress {
+                        title: Some(report.title),
+                        is_disk_based_diagnostics_progress,
+                        is_cancellable: report.cancellable.unwrap_or(false),
+                        message: report.message.clone(),
+                        percentage: report.percentage.map(|p| p as usize),
+                        last_update_at: cx.background_executor().now(),
+                    },
+                    cx,
+                );
             }
             lsp::WorkDoneProgress::Report(report) => {
-                if !is_disk_based_diagnostics_progress {
-                    self.on_lsp_work_progress(
-                        language_server_id,
-                        token.clone(),
-                        LanguageServerProgress {
-                            message: report.message.clone(),
-                            percentage: report.percentage.map(|p| p as usize),
-                            last_update_at: Instant::now(),
-                        },
-                        cx,
-                    );
-                    self.enqueue_language_server_progress(
+                if self.on_lsp_work_progress(
+                    language_server_id,
+                    token.clone(),
+                    LanguageServerProgress {
+                        title: None,
+                        is_disk_based_diagnostics_progress,
+                        is_cancellable: report.cancellable.unwrap_or(false),
+                        message: report.message.clone(),
+                        percentage: report.percentage.map(|p| p as usize),
+                        last_update_at: cx.background_executor().now(),
+                    },
+                    cx,
+                ) {
+                    self.enqueue_buffer_ordered_message(
                         BufferOrderedMessage::LanguageServerUpdate {
                             language_server_id,
                             message: proto::update_language_server::Variant::WorkProgress(
@@ -4314,17 +4335,15 @@ impl Project {
                                 },
                             ),
                         },
-                        cx,
-                    );
+                    )
+                    .ok();
                 }
             }
             lsp::WorkDoneProgress::End(_) => {
                 language_server_status.progress_tokens.remove(&token);
-
+                self.on_lsp_work_end(language_server_id, token.clone(), cx);
                 if is_disk_based_diagnostics_progress {
                     self.disk_based_diagnostics_finished(language_server_id, cx);
-                } else {
-                    self.on_lsp_work_end(language_server_id, token.clone(), cx);
                 }
             }
         }
@@ -4347,6 +4366,7 @@ impl Project {
                 language_server_id,
                 message: proto::update_language_server::Variant::WorkStart(proto::LspWorkStart {
                     token,
+                    title: progress.title,
                     message: progress.message,
                     percentage: progress.percentage.map(|p| p as u32),
                 }),
@@ -4361,25 +4381,34 @@ impl Project {
         token: String,
         progress: LanguageServerProgress,
         cx: &mut ModelContext<Self>,
-    ) {
+    ) -> bool {
         if let Some(status) = self.language_server_statuses.get_mut(&language_server_id) {
-            let entry = status
-                .pending_work
-                .entry(token)
-                .or_insert(LanguageServerProgress {
-                    message: Default::default(),
-                    percentage: Default::default(),
-                    last_update_at: progress.last_update_at,
-                });
-            if progress.message.is_some() {
-                entry.message = progress.message;
+            match status.pending_work.entry(token) {
+                btree_map::Entry::Vacant(entry) => {
+                    entry.insert(progress);
+                    cx.notify();
+                    return true;
+                }
+                btree_map::Entry::Occupied(mut entry) => {
+                    let entry = entry.get_mut();
+                    if (progress.last_update_at - entry.last_update_at)
+                        >= SERVER_PROGRESS_THROTTLE_TIMEOUT
+                    {
+                        entry.last_update_at = progress.last_update_at;
+                        if progress.message.is_some() {
+                            entry.message = progress.message;
+                        }
+                        if progress.percentage.is_some() {
+                            entry.percentage = progress.percentage;
+                        }
+                        cx.notify();
+                        return true;
+                    }
+                }
             }
-            if progress.percentage.is_some() {
-                entry.percentage = progress.percentage;
-            }
-            entry.last_update_at = progress.last_update_at;
-            cx.notify();
         }
+
+        false
     }
 
     fn on_lsp_work_end(
@@ -4389,8 +4418,11 @@ impl Project {
         cx: &mut ModelContext<Self>,
     ) {
         if let Some(status) = self.language_server_statuses.get_mut(&language_server_id) {
-            cx.emit(Event::RefreshInlayHints);
-            status.pending_work.remove(&token);
+            if let Some(work) = status.pending_work.remove(&token) {
+                if !work.is_disk_based_diagnostics_progress {
+                    cx.emit(Event::RefreshInlayHints);
+                }
+            }
             cx.notify();
         }
 
@@ -4562,8 +4594,10 @@ impl Project {
 
     pub fn language_server_statuses(
         &self,
-    ) -> impl DoubleEndedIterator<Item = &LanguageServerStatus> {
-        self.language_server_statuses.values()
+    ) -> impl DoubleEndedIterator<Item = (LanguageServerId, &LanguageServerStatus)> {
+        self.language_server_statuses
+            .iter()
+            .map(|(key, value)| (*key, value))
     }
 
     pub fn last_formatting_failure(&self) -> Option<&str> {
@@ -5795,11 +5829,68 @@ impl Project {
         self.hover_impl(buffer, position, cx)
     }
 
+    fn linked_edit_impl(
+        &self,
+        buffer: &Model<Buffer>,
+        position: Anchor,
+        cx: &mut ModelContext<Self>,
+    ) -> Task<Result<Vec<Range<Anchor>>>> {
+        let snapshot = buffer.read(cx).snapshot();
+        let scope = snapshot.language_scope_at(position);
+        let Some(server_id) = self
+            .language_servers_for_buffer(buffer.read(cx), cx)
+            .filter(|(_, server)| {
+                server
+                    .capabilities()
+                    .linked_editing_range_provider
+                    .is_some()
+            })
+            .filter(|(adapter, _)| {
+                scope
+                    .as_ref()
+                    .map(|scope| scope.language_allowed(&adapter.name))
+                    .unwrap_or(true)
+            })
+            .map(|(_, server)| LanguageServerToQuery::Other(server.server_id()))
+            .next()
+            .or_else(|| self.is_remote().then_some(LanguageServerToQuery::Primary))
+            .filter(|_| {
+                maybe!({
+                    let language_name = buffer.read(cx).language_at(position)?.name();
+                    Some(
+                        AllLanguageSettings::get_global(cx)
+                            .language(Some(&language_name))
+                            .linked_edits,
+                    )
+                }) == Some(true)
+            })
+        else {
+            return Task::ready(Ok(vec![]));
+        };
+
+        self.request_lsp(
+            buffer.clone(),
+            server_id,
+            LinkedEditingRange { position },
+            cx,
+        )
+    }
+
+    pub fn linked_edit(
+        &self,
+        buffer: &Model<Buffer>,
+        position: Anchor,
+        cx: &mut ModelContext<Self>,
+    ) -> Task<Result<Vec<Range<Anchor>>>> {
+        self.linked_edit_impl(buffer, position, cx)
+    }
+
     #[inline(never)]
     fn completions_impl(
         &self,
         buffer: &Model<Buffer>,
         position: PointUtf16,
+        context: CompletionContext,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<Vec<Completion>>> {
         let language_registry = self.languages.clone();
@@ -5833,7 +5924,10 @@ impl Project {
                             this.request_lsp(
                                 buffer.clone(),
                                 LanguageServerToQuery::Other(server_id),
-                                GetCompletions { position },
+                                GetCompletions {
+                                    position,
+                                    context: context.clone(),
+                                },
                                 cx,
                             ),
                         ));
@@ -5860,7 +5954,7 @@ impl Project {
             let task = self.send_lsp_proto_request(
                 buffer.clone(),
                 project_id,
-                GetCompletions { position },
+                GetCompletions { position, context },
                 cx,
             );
             let language = buffer.read(cx).language().cloned();
@@ -5894,10 +5988,11 @@ impl Project {
         &self,
         buffer: &Model<Buffer>,
         position: T,
+        context: CompletionContext,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<Vec<Completion>>> {
         let position = position.to_point_utf16(buffer.read(cx));
-        self.completions_impl(buffer, position, cx)
+        self.completions_impl(buffer, position, context, cx)
     }
 
     pub fn resolve_completions(
@@ -6046,6 +6141,14 @@ impl Project {
 
                 completion.new_text = new_text;
                 completion.old_range = old_range;
+            }
+        }
+        if completion_item.insert_text_format == Some(InsertTextFormat::SNIPPET) {
+            // vtsls might change the type of completion after resolution.
+            let mut completions = completions.write();
+            let completion = &mut completions[completion_index];
+            if completion_item.insert_text_format != completion.lsp_completion.insert_text_format {
+                completion.lsp_completion.insert_text_format = completion_item.insert_text_format;
             }
         }
     }
@@ -7108,7 +7211,9 @@ impl Project {
             } else {
                 false
             };
-            matching_paths.sort_by_key(|candidate| (candidate.is_ignored(), candidate.path()));
+            cx.update(|cx| {
+                sort_search_matches(&mut matching_paths, cx);
+            })?;
 
             let mut range_count = 0;
             let query = Arc::new(query);
@@ -7247,7 +7352,7 @@ impl Project {
 
                 if query.include_ignored() {
                     for (snapshot, settings) in snapshots {
-                        for ignored_entry in snapshot.entries(true).filter(|e| e.is_ignored) {
+                        for ignored_entry in snapshot.entries(true, 0).filter(|e| e.is_ignored) {
                             let limiter = Arc::clone(&max_concurrent_workers);
                             scope.spawn(async move {
                                 let _guard = limiter.acquire().await;
@@ -7311,9 +7416,12 @@ impl Project {
                                     language_server.server_id(),
                                     id.to_string(),
                                     LanguageServerProgress {
+                                        is_disk_based_diagnostics_progress: false,
+                                        is_cancellable: false,
+                                        title: None,
                                         message: status.clone(),
                                         percentage: None,
-                                        last_update_at: Instant::now(),
+                                        last_update_at: cx.background_executor().now(),
                                     },
                                     cx,
                                 );
@@ -7689,7 +7797,10 @@ impl Project {
                         changes.clone(),
                     ));
 
-                    this.report_yarn_project(&worktree, changes, cx);
+                    let worktree_id = worktree.update(cx, |worktree, _| worktree.id());
+                    this.client()
+                        .telemetry()
+                        .report_discovered_project_events(worktree_id, changes);
                 }
                 worktree::Event::UpdatedGitRepositories(updated_repos) => {
                     if is_local {
@@ -7740,32 +7851,6 @@ impl Project {
 
         cx.emit(Event::WorktreeAdded);
         self.metadata_changed(cx);
-    }
-
-    fn report_yarn_project(
-        &mut self,
-        worktree: &Model<Worktree>,
-        updated_entries_set: &UpdatedEntriesSet,
-        cx: &mut ModelContext<Self>,
-    ) {
-        let worktree_id = worktree.update(cx, |worktree, _| worktree.id());
-
-        if !self.yarn_worktree_ids_reported.contains(&worktree_id) {
-            let is_yarn_project = updated_entries_set.iter().any(|(path, _, _)| {
-                path.as_ref()
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|name_str| name_str == "yarn.lock")
-                    .unwrap_or(false)
-            });
-
-            if is_yarn_project {
-                self.client()
-                    .telemetry()
-                    .report_app_event("open yarn project".to_string());
-                self.yarn_worktree_ids_reported.push(worktree_id);
-            }
-        }
     }
 
     fn update_local_worktree_buffers(
@@ -8108,10 +8193,10 @@ impl Project {
                 }
             };
 
-            if abs_path.ends_with(&*LOCAL_SETTINGS_RELATIVE_PATH) {
+            if abs_path.ends_with(local_settings_file_relative_path()) {
                 let settings_dir = Arc::from(
                     path.ancestors()
-                        .nth(LOCAL_SETTINGS_RELATIVE_PATH.components().count())
+                        .nth(local_settings_file_relative_path().components().count())
                         .unwrap(),
                 );
                 let fs = self.fs.clone();
@@ -8125,7 +8210,7 @@ impl Project {
                         },
                     )
                 });
-            } else if abs_path.ends_with(&*LOCAL_TASKS_RELATIVE_PATH) {
+            } else if abs_path.ends_with(local_tasks_file_relative_path()) {
                 self.task_inventory().update(cx, |task_inventory, cx| {
                     if removed {
                         task_inventory.remove_local_static_source(&abs_path);
@@ -8145,7 +8230,7 @@ impl Project {
                         );
                     }
                 })
-            } else if abs_path.ends_with(&*LOCAL_VSCODE_TASKS_RELATIVE_PATH) {
+            } else if abs_path.ends_with(local_vscode_tasks_file_relative_path()) {
                 self.task_inventory().update(cx, |task_inventory, cx| {
                     if removed {
                         task_inventory.remove_local_static_source(&abs_path);
@@ -8953,9 +9038,12 @@ impl Project {
                         language_server_id,
                         payload.token,
                         LanguageServerProgress {
+                            title: payload.title,
+                            is_disk_based_diagnostics_progress: false,
+                            is_cancellable: false,
                             message: payload.message,
                             percentage: payload.percentage.map(|p| p as usize),
-                            last_update_at: Instant::now(),
+                            last_update_at: cx.background_executor().now(),
                         },
                         cx,
                     );
@@ -8966,9 +9054,12 @@ impl Project {
                         language_server_id,
                         payload.token,
                         LanguageServerProgress {
+                            title: None,
+                            is_disk_based_diagnostics_progress: false,
+                            is_cancellable: false,
                             message: payload.message,
                             percentage: payload.percentage.map(|p| p as usize),
-                            last_update_at: Instant::now(),
+                            last_update_at: cx.background_executor().now(),
                         },
                         cx,
                     );
@@ -11165,6 +11256,7 @@ async fn search_snapshots(
                         worktree_id: snapshot.id(),
                         path: entry.path.clone(),
                         is_ignored: entry.is_ignored,
+                        is_file: entry.is_file(),
                     };
                     if results_tx.send(project_path).await.is_err() {
                         return;
@@ -11237,6 +11329,7 @@ async fn search_ignored_entry(
                                 .expect("scanning worktree-related files"),
                         ),
                         is_ignored: true,
+                        is_file: ignored_entry.is_file(),
                     };
                     if counter_tx.send(project_path).await.is_err() {
                         return;
@@ -11305,7 +11398,16 @@ pub struct PathMatchCandidateSet {
     pub snapshot: Snapshot,
     pub include_ignored: bool,
     pub include_root_name: bool,
-    pub directories_only: bool,
+    pub candidates: Candidates,
+}
+
+pub enum Candidates {
+    /// Only consider directories.
+    Directories,
+    /// Only consider files.
+    Files,
+    /// Consider directories and files.
+    Entries,
 }
 
 impl<'a> fuzzy::PathMatchCandidateSet<'a> for PathMatchCandidateSet {
@@ -11335,10 +11437,10 @@ impl<'a> fuzzy::PathMatchCandidateSet<'a> for PathMatchCandidateSet {
 
     fn candidates(&'a self, start: usize) -> Self::Candidates {
         PathMatchCandidateSetIter {
-            traversal: if self.directories_only {
-                self.snapshot.directories(self.include_ignored, start)
-            } else {
-                self.snapshot.files(self.include_ignored, start)
+            traversal: match self.candidates {
+                Candidates::Directories => self.snapshot.directories(self.include_ignored, start),
+                Candidates::Files => self.snapshot.files(self.include_ignored, start),
+                Candidates::Entries => self.snapshot.entries(self.include_ignored, start),
             },
         }
     }
@@ -11890,6 +11992,130 @@ impl DiagnosticSummary {
             language_server_id: language_server_id.0 as u64,
             error_count: self.error_count as u32,
             warning_count: self.warning_count as u32,
+        }
+    }
+}
+
+pub fn sort_worktree_entries(entries: &mut Vec<Entry>) {
+    entries.sort_by(|entry_a, entry_b| {
+        compare_paths(
+            (&entry_a.path, entry_a.is_file()),
+            (&entry_b.path, entry_b.is_file()),
+        )
+    });
+}
+
+fn sort_search_matches(search_matches: &mut Vec<SearchMatchCandidate>, cx: &AppContext) {
+    search_matches.sort_by(|entry_a, entry_b| match (entry_a, entry_b) {
+        (
+            SearchMatchCandidate::OpenBuffer {
+                buffer: buffer_a,
+                path: None,
+            },
+            SearchMatchCandidate::OpenBuffer {
+                buffer: buffer_b,
+                path: None,
+            },
+        ) => buffer_a
+            .read(cx)
+            .remote_id()
+            .cmp(&buffer_b.read(cx).remote_id()),
+        (
+            SearchMatchCandidate::OpenBuffer { path: None, .. },
+            SearchMatchCandidate::Path { .. }
+            | SearchMatchCandidate::OpenBuffer { path: Some(_), .. },
+        ) => Ordering::Less,
+        (
+            SearchMatchCandidate::OpenBuffer { path: Some(_), .. }
+            | SearchMatchCandidate::Path { .. },
+            SearchMatchCandidate::OpenBuffer { path: None, .. },
+        ) => Ordering::Greater,
+        (
+            SearchMatchCandidate::OpenBuffer {
+                path: Some(path_a), ..
+            },
+            SearchMatchCandidate::Path {
+                is_file: is_file_b,
+                path: path_b,
+                ..
+            },
+        ) => compare_paths((path_a.as_ref(), true), (path_b.as_ref(), *is_file_b)),
+        (
+            SearchMatchCandidate::Path {
+                is_file: is_file_a,
+                path: path_a,
+                ..
+            },
+            SearchMatchCandidate::OpenBuffer {
+                path: Some(path_b), ..
+            },
+        ) => compare_paths((path_a.as_ref(), *is_file_a), (path_b.as_ref(), true)),
+        (
+            SearchMatchCandidate::OpenBuffer {
+                path: Some(path_a), ..
+            },
+            SearchMatchCandidate::OpenBuffer {
+                path: Some(path_b), ..
+            },
+        ) => compare_paths((path_a.as_ref(), true), (path_b.as_ref(), true)),
+        (
+            SearchMatchCandidate::Path {
+                worktree_id: worktree_id_a,
+                is_file: is_file_a,
+                path: path_a,
+                ..
+            },
+            SearchMatchCandidate::Path {
+                worktree_id: worktree_id_b,
+                is_file: is_file_b,
+                path: path_b,
+                ..
+            },
+        ) => worktree_id_a.cmp(&worktree_id_b).then_with(|| {
+            compare_paths((path_a.as_ref(), *is_file_a), (path_b.as_ref(), *is_file_b))
+        }),
+    });
+}
+
+fn compare_paths(
+    (path_a, a_is_file): (&Path, bool),
+    (path_b, b_is_file): (&Path, bool),
+) -> cmp::Ordering {
+    let mut components_a = path_a.components().peekable();
+    let mut components_b = path_b.components().peekable();
+    loop {
+        match (components_a.next(), components_b.next()) {
+            (Some(component_a), Some(component_b)) => {
+                let a_is_file = components_a.peek().is_none() && a_is_file;
+                let b_is_file = components_b.peek().is_none() && b_is_file;
+                let ordering = a_is_file.cmp(&b_is_file).then_with(|| {
+                    let maybe_numeric_ordering = maybe!({
+                        let num_and_remainder_a = Path::new(component_a.as_os_str())
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .and_then(NumericPrefixWithSuffix::from_numeric_prefixed_str)?;
+                        let num_and_remainder_b = Path::new(component_b.as_os_str())
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .and_then(NumericPrefixWithSuffix::from_numeric_prefixed_str)?;
+
+                        num_and_remainder_a.partial_cmp(&num_and_remainder_b)
+                    });
+
+                    maybe_numeric_ordering.unwrap_or_else(|| {
+                        let name_a = UniCase::new(component_a.as_os_str().to_string_lossy());
+                        let name_b = UniCase::new(component_b.as_os_str().to_string_lossy());
+
+                        name_a.cmp(&name_b)
+                    })
+                });
+                if !ordering.is_eq() {
+                    return ordering;
+                }
+            }
+            (Some(_), None) => break cmp::Ordering::Greater,
+            (None, Some(_)) => break cmp::Ordering::Less,
+            (None, None) => break cmp::Ordering::Equal,
         }
     }
 }

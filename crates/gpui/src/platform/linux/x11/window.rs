@@ -1,3 +1,5 @@
+use anyhow::Context;
+
 use crate::{
     platform::blade::{BladeRenderer, BladeSurfaceConfig},
     px, size, AnyWindowHandle, Bounds, DevicePixels, ForegroundExecutor, Modifiers, Pixels,
@@ -8,7 +10,7 @@ use crate::{
 
 use blade_graphics as gpu;
 use raw_window_handle as rwh;
-use util::ResultExt;
+use util::{maybe, ResultExt};
 use x11rb::{
     connection::Connection,
     protocol::{
@@ -32,7 +34,6 @@ use std::{
 };
 
 use super::{X11Display, XINPUT_MASTER_DEVICE};
-
 x11rb::atom_manager! {
     pub XcbAtoms: AtomsCookie {
         UTF8_STRING,
@@ -268,6 +269,11 @@ impl X11WindowState {
             );
 
         let mut bounds = params.bounds.to_device_pixels(scale_factor);
+        if bounds.size.width.0 == 0 || bounds.size.height.0 == 0 {
+            log::warn!("Window bounds contain a zero value. height={}, width={}. Falling back to defaults.", bounds.size.height.0, bounds.size.width.0);
+            bounds.size.width = 800.into();
+            bounds.size.height = 600.into();
+        }
 
         xcb_connection
             .create_window(
@@ -284,7 +290,10 @@ impl X11WindowState {
                 &win_aux,
             )
             .unwrap()
-            .check()?;
+            .check().with_context(|| {
+                format!("CreateWindow request to X server failed. depth: {}, x_window: {}, visual_set.root: {}, bounds.origin.x.0: {}, bounds.origin.y.0: {}, bounds.size.width.0: {}, bounds.size.height.0: {}",
+                    visual.depth, x_window, visual_set.root, bounds.origin.x.0 + 2, bounds.origin.y.0, bounds.size.width.0, bounds.size.height.0)
+            })?;
 
         let reply = xcb_connection
             .get_geometry(x_window)
@@ -422,26 +431,32 @@ impl Drop for X11Window {
         let mut state = self.0.state.borrow_mut();
         state.renderer.destroy();
 
-        self.0.xcb_connection.unmap_window(self.0.x_window).unwrap();
-        self.0
-            .xcb_connection
-            .destroy_window(self.0.x_window)
-            .unwrap();
-        self.0.xcb_connection.flush().unwrap();
+        let destroy_x_window = maybe!({
+            self.0.xcb_connection.unmap_window(self.0.x_window)?;
+            self.0.xcb_connection.destroy_window(self.0.x_window)?;
+            self.0.xcb_connection.flush()?;
 
-        // Mark window as destroyed so that we can filter out when X11 events
-        // for it still come in.
-        state.destroyed = true;
+            anyhow::Ok(())
+        })
+        .context("unmapping and destroying X11 window")
+        .log_err();
 
-        let this_ptr = self.0.clone();
-        let client_ptr = state.client.clone();
-        state
-            .executor
-            .spawn(async move {
-                this_ptr.close();
-                client_ptr.drop_window(this_ptr.x_window);
-            })
-            .detach();
+        if destroy_x_window.is_some() {
+            // Mark window as destroyed so that we can filter out when X11 events
+            // for it still come in.
+            state.destroyed = true;
+
+            let this_ptr = self.0.clone();
+            let client_ptr = state.client.clone();
+            state
+                .executor
+                .spawn(async move {
+                    this_ptr.close();
+                    client_ptr.drop_window(this_ptr.x_window);
+                })
+                .detach();
+        }
+
         drop(state);
     }
 }

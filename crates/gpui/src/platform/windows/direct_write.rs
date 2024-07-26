@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, mem::ManuallyDrop, sync::Arc};
 
 use ::util::ResultExt;
 use anyhow::{anyhow, Result};
@@ -39,7 +39,7 @@ pub(crate) struct DirectWriteTextSystem(RwLock<DirectWriteState>);
 struct DirectWriteComponent {
     locale: String,
     factory: IDWriteFactory5,
-    bitmap_factory: IWICImagingFactory2,
+    bitmap_factory: ManuallyDrop<IWICImagingFactory2>,
     d2d1_factory: ID2D1Factory,
     in_memory_loader: IDWriteInMemoryFontFileLoader,
     builder: IDWriteFontSetBuilder1,
@@ -49,8 +49,7 @@ struct DirectWriteComponent {
 
 struct GlyphRenderContext {
     params: IDWriteRenderingParams3,
-    normal_dc_target: ID2D1DeviceContext4,
-    emoji_dc_target: ID2D1DeviceContext4,
+    dc_target: ID2D1DeviceContext4,
 }
 
 // All use of the IUnknown methods should be "thread-safe".
@@ -80,6 +79,7 @@ impl DirectWriteComponent {
             let factory: IDWriteFactory5 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let bitmap_factory: IWICImagingFactory2 =
                 CoCreateInstance(&CLSID_WICImagingFactory2, None, CLSCTX_INPROC_SERVER)?;
+            let bitmap_factory = ManuallyDrop::new(bitmap_factory);
             let d2d1_factory: ID2D1Factory =
                 D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, None)?;
             // The `IDWriteInMemoryFontFileLoader` here is supported starting from
@@ -128,16 +128,7 @@ impl GlyphRenderContext {
                 DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
                 grid_fit_mode,
             )?;
-            let normal_dc_target = {
-                let target = d2d1_factory.CreateDCRenderTarget(&get_render_target_property(
-                    DXGI_FORMAT_A8_UNORM,
-                    D2D1_ALPHA_MODE_STRAIGHT,
-                ))?;
-                let target = target.cast::<ID2D1DeviceContext4>()?;
-                target.SetTextRenderingParams(&params);
-                target
-            };
-            let emoji_dc_target = {
+            let dc_target = {
                 let target = d2d1_factory.CreateDCRenderTarget(&get_render_target_property(
                     DXGI_FORMAT_B8G8R8A8_UNORM,
                     D2D1_ALPHA_MODE_PREMULTIPLIED,
@@ -147,11 +138,7 @@ impl GlyphRenderContext {
                 target
             };
 
-            Ok(Self {
-                params,
-                normal_dc_target,
-                emoji_dc_target,
-            })
+            Ok(Self { params, dc_target })
         }
     }
 }
@@ -183,6 +170,11 @@ impl DirectWriteTextSystem {
             font_selections: HashMap::default(),
             font_id_by_identifier: HashMap::default(),
         })))
+    }
+
+    pub(crate) fn destroy(&self) {
+        let mut lock = self.0.write();
+        unsafe { ManuallyDrop::drop(&mut lock.components.bitmap_factory) };
     }
 }
 
@@ -571,11 +563,7 @@ impl DirectWriteState {
     }
 
     fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
-        let render_target = if params.is_emoji {
-            &self.components.render_context.emoji_dc_target
-        } else {
-            &self.components.render_context.normal_dc_target
-        };
+        let render_target = &self.components.render_context.dc_target;
         unsafe {
             render_target.SetUnitMode(D2D1_UNIT_MODE_DIPS);
             render_target.SetDpi(96.0 * params.scale_factor, 96.0 * params.scale_factor);
@@ -601,6 +589,18 @@ impl DirectWriteState {
                 DWRITE_MEASURING_MODE_NATURAL,
             )?
         };
+        // todo(windows)
+        // This is a walkaround, deleted when figured out.
+        let y_offset;
+        let extra_height;
+        if params.is_emoji {
+            y_offset = 0;
+            extra_height = 0;
+        } else {
+            // make some room for scaler.
+            y_offset = -1;
+            extra_height = 2;
+        }
 
         if bounds.right < bounds.left {
             Ok(Bounds {
@@ -611,11 +611,13 @@ impl DirectWriteState {
             Ok(Bounds {
                 origin: point(
                     ((bounds.left * params.scale_factor).ceil() as i32).into(),
-                    ((bounds.top * params.scale_factor).ceil() as i32).into(),
+                    ((bounds.top * params.scale_factor).ceil() as i32 + y_offset).into(),
                 ),
                 size: size(
                     (((bounds.right - bounds.left) * params.scale_factor).ceil() as i32).into(),
-                    (((bounds.bottom - bounds.top) * params.scale_factor).ceil() as i32).into(),
+                    (((bounds.bottom - bounds.top) * params.scale_factor).ceil() as i32
+                        + extra_height)
+                        .into(),
                 ),
             })
         }
@@ -922,7 +924,7 @@ struct RendererContext<'t, 'a, 'b> {
 }
 
 #[allow(non_snake_case)]
-impl IDWritePixelSnapping_Impl for TextRenderer {
+impl IDWritePixelSnapping_Impl for TextRenderer_Impl {
     fn IsPixelSnappingDisabled(
         &self,
         _clientdrawingcontext: *const ::core::ffi::c_void,
@@ -957,7 +959,7 @@ impl IDWritePixelSnapping_Impl for TextRenderer {
 }
 
 #[allow(non_snake_case)]
-impl IDWriteTextRenderer_Impl for TextRenderer {
+impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
     fn DrawGlyphRun(
         &self,
         clientdrawingcontext: *const ::core::ffi::c_void,

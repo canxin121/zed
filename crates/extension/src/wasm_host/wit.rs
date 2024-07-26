@@ -29,7 +29,7 @@ pub fn new_linker(
     f: impl Fn(&mut Linker<WasmState>, fn(&mut WasmState) -> &mut WasmState) -> Result<()>,
 ) -> Linker<WasmState> {
     let mut linker = Linker::new(&wasm_engine());
-    wasmtime_wasi::command::add_to_linker(&mut linker).unwrap();
+    wasmtime_wasi::add_to_linker_async(&mut linker).unwrap();
     f(&mut linker, wasi_view).unwrap();
     linker
 }
@@ -49,10 +49,9 @@ pub fn is_supported_wasm_api_version(
 /// Returns the Wasm API version range that is supported by the Wasm host.
 #[inline(always)]
 pub fn wasm_api_version_range(release_channel: ReleaseChannel) -> RangeInclusive<SemanticVersion> {
-    let max_version = if release_channel == ReleaseChannel::Dev {
-        latest::MAX_VERSION
-    } else {
-        since_v0_0_6::MAX_VERSION
+    let max_version = match release_channel {
+        ReleaseChannel::Dev | ReleaseChannel::Nightly => latest::MAX_VERSION,
+        ReleaseChannel::Stable | ReleaseChannel::Preview => since_v0_0_6::MAX_VERSION,
     };
 
     since_v0_0_1::MIN_VERSION..=max_version

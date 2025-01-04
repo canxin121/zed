@@ -1,15 +1,15 @@
 use assets::Assets;
-use gpui::*;
+use gpui::{rgb, App, KeyBinding, Length, StyleRefinement, View, WindowOptions};
 use language::{language_settings::AllLanguageSettings, LanguageRegistry};
 use markdown::{Markdown, MarkdownStyle};
-use node_runtime::FakeNodeRuntime;
+use node_runtime::NodeRuntime;
 use settings::SettingsStore;
 use std::sync::Arc;
 use theme::LoadThemes;
 use ui::div;
 use ui::prelude::*;
 
-const MARKDOWN_EXAMPLE: &'static str = r#"
+const MARKDOWN_EXAMPLE: &str = r#"
 this text should be selectable
 
 wow so cool
@@ -28,11 +28,8 @@ pub fn main() {
         });
         cx.bind_keys([KeyBinding::new("cmd-c", markdown::Copy, None)]);
 
-        let node_runtime = FakeNodeRuntime::new();
-        let language_registry = Arc::new(LanguageRegistry::new(
-            Task::ready(()),
-            cx.background_executor().clone(),
-        ));
+        let node_runtime = NodeRuntime::unavailable();
+        let language_registry = Arc::new(LanguageRegistry::new(cx.background_executor().clone()));
         languages::init(language_registry.clone(), node_runtime, cx);
         theme::init(LoadThemes::JustBase, cx);
         Assets.load_fonts(cx).unwrap();
@@ -90,7 +87,7 @@ pub fn main() {
                     heading: Default::default(),
                 };
                 let markdown = cx.new_view(|cx| {
-                    Markdown::new(MARKDOWN_EXAMPLE.into(), markdown_style, None, cx, None)
+                    Markdown::new(MARKDOWN_EXAMPLE.into(), markdown_style, None, None, cx)
                 });
 
                 HelloWorld { markdown }

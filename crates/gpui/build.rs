@@ -18,7 +18,9 @@ fn main() {
             let rc_file = std::path::Path::new("resources/windows/gpui.rc");
             println!("cargo:rerun-if-changed={}", manifest.display());
             println!("cargo:rerun-if-changed={}", rc_file.display());
-            embed_resource::compile(rc_file, embed_resource::NONE);
+            embed_resource::compile(rc_file, embed_resource::NONE)
+                .manifest_required()
+                .unwrap();
         }
         _ => (),
     };
@@ -48,6 +50,7 @@ mod macos {
 
     fn generate_dispatch_bindings() {
         println!("cargo:rustc-link-lib=framework=System");
+        println!("cargo:rustc-link-lib=framework=ScreenCaptureKit");
         println!("cargo:rerun-if-changed=src/platform/mac/dispatch.h");
 
         let bindings = bindgen::Builder::default()
@@ -67,7 +70,7 @@ mod macos {
             .allowlist_function("dispatch_suspend")
             .allowlist_function("dispatch_source_cancel")
             .allowlist_function("dispatch_set_context")
-            .parse_callbacks(Box::new(bindgen::CargoCallbacks))
+            .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
             .layout_tests(false)
             .generate()
             .expect("unable to generate bindings");
@@ -81,9 +84,12 @@ mod macos {
     fn generate_shader_bindings() -> PathBuf {
         let output_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("scene.h");
         let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-        let mut config = Config::default();
-        config.include_guard = Some("SCENE_H".into());
-        config.language = cbindgen::Language::C;
+        let mut config = Config {
+            include_guard: Some("SCENE_H".into()),
+            language: cbindgen::Language::C,
+            no_includes: true,
+            ..Default::default()
+        };
         config.export.include.extend([
             "Bounds".into(),
             "Corners".into(),
@@ -178,7 +184,7 @@ mod macos {
                 "-c",
                 shader_path,
                 "-include",
-                &header_path.to_str().unwrap(),
+                (header_path.to_str().unwrap()),
                 "-o",
             ])
             .arg(&air_output_path)

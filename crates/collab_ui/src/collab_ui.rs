@@ -14,7 +14,7 @@ use gpui::{
 };
 use panel_settings::MessageEditorSettings;
 pub use panel_settings::{
-    ChatPanelSettings, CollaborationPanelSettings, NotificationPanelSettings,
+    ChatPanelButton, ChatPanelSettings, CollaborationPanelSettings, NotificationPanelSettings,
 };
 use release_channel::ReleaseChannel;
 use settings::Settings;
@@ -31,9 +31,8 @@ pub fn init(app_state: &Arc<AppState>, cx: &mut AppContext) {
     chat_panel::init(cx);
     collab_panel::init(cx);
     notification_panel::init(cx);
-    notifications::init(&app_state, cx);
+    notifications::init(app_state, cx);
     title_bar::init(cx);
-    vcs_menu::init(cx);
 }
 
 fn notification_window_options(
@@ -45,7 +44,7 @@ fn notification_window_options(
     let notification_margin_height = px(-48.);
 
     let bounds = gpui::Bounds::<Pixels> {
-        origin: screen.bounds().upper_right()
+        origin: screen.bounds().top_right()
             - point(
                 size.width + notification_margin_width,
                 notification_margin_height,

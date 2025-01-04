@@ -1,8 +1,14 @@
-use gpui::{svg, AnimationElement, Hsla, IntoElement, Rems, Transformation};
+#![allow(missing_docs)]
+use gpui::{svg, AnimationElement, Hsla, IntoElement, Point, Rems, Transformation};
 use serde::{Deserialize, Serialize};
-use strum::{EnumIter, EnumString, IntoStaticStr};
+use strum::{EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
+use ui_macros::DerivePathStr;
 
-use crate::{prelude::*, Indicator};
+use crate::{
+    prelude::*,
+    traits::component_preview::{ComponentExample, ComponentPreview},
+    Indicator,
+};
 
 #[derive(IntoElement)]
 pub enum AnyIcon {
@@ -42,17 +48,6 @@ impl RenderOnce for AnyIcon {
     }
 }
 
-/// The decoration for an icon.
-///
-/// For example, this can show an indicator, an "x",
-/// or a diagonal strkethrough to indicate something is disabled.
-#[derive(Debug, PartialEq, Copy, Clone, EnumIter)]
-pub enum IconDecoration {
-    Strikethrough,
-    IndicatorDot,
-    X,
-}
-
 #[derive(Default, PartialEq, Copy, Clone)]
 pub enum IconSize {
     /// 10px
@@ -84,10 +79,10 @@ impl IconSize {
     pub fn square_components(&self, cx: &mut WindowContext) -> (Pixels, Pixels) {
         let icon_size = self.rems() * cx.rem_size();
         let padding = match self {
-            IconSize::Indicator => Spacing::None.px(cx),
-            IconSize::XSmall => Spacing::XSmall.px(cx),
-            IconSize::Small => Spacing::XSmall.px(cx),
-            IconSize::Medium => Spacing::XSmall.px(cx),
+            IconSize::Indicator => DynamicSpacing::Base00.px(cx),
+            IconSize::XSmall => DynamicSpacing::Base02.px(cx),
+            IconSize::Small => DynamicSpacing::Base02.px(cx),
+            IconSize::Medium => DynamicSpacing::Base02.px(cx),
         };
 
         (icon_size, padding)
@@ -102,10 +97,28 @@ impl IconSize {
 }
 
 #[derive(
-    Debug, PartialEq, Eq, Copy, Clone, EnumIter, EnumString, IntoStaticStr, Serialize, Deserialize,
+    Debug,
+    PartialEq,
+    Eq,
+    Copy,
+    Clone,
+    EnumIter,
+    EnumString,
+    IntoStaticStr,
+    Serialize,
+    Deserialize,
+    DerivePathStr,
 )]
+#[strum(serialize_all = "snake_case")]
+#[path_str(prefix = "icons", suffix = ".svg")]
 pub enum IconName {
     Ai,
+    AiAnthropic,
+    AiAnthropicHosted,
+    AiGoogle,
+    AiOllama,
+    AiOpenAi,
+    AiZed,
     ArrowCircle,
     ArrowDown,
     ArrowDownFromLine,
@@ -122,6 +135,7 @@ pub enum IconName {
     BellDot,
     BellOff,
     BellRing,
+    Blocks,
     Bolt,
     Book,
     BookCopy,
@@ -129,15 +143,13 @@ pub enum IconName {
     CaseSensitive,
     Check,
     ChevronDown,
-    /// This chevron indicates a popover menu.
-    ChevronDownSmall,
+    ChevronDownSmall, // This chevron indicates a popover menu.
     ChevronLeft,
     ChevronRight,
     ChevronUp,
     ChevronUpDown,
     Close,
     Code,
-    Collab,
     Command,
     Context,
     Control,
@@ -147,28 +159,34 @@ pub enum IconName {
     CopilotInit,
     Copy,
     CountdownTimer,
+    CursorIBeam,
     Dash,
+    DatabaseZap,
     Delete,
+    Diff,
     Disconnected,
     Download,
     Ellipsis,
+    EllipsisVertical,
     Envelope,
+    Eraser,
     Escape,
-    ExclamationTriangle,
-    Exit,
     ExpandVertical,
+    Exit,
     ExternalLink,
     Eye,
     File,
+    FileCode,
     FileDoc,
+    FileDiff,
     FileGeneric,
     FileGit,
     FileLock,
     FileRust,
+    FileSearch,
+    FileText,
     FileToml,
     FileTree,
-    FileText,
-    FileCode,
     Filter,
     Folder,
     FolderOpen,
@@ -176,39 +194,51 @@ pub enum IconName {
     Font,
     FontSize,
     FontWeight,
-    Github,
-    GenericMinimize,
-    GenericMaximize,
     GenericClose,
+    GenericMaximize,
+    GenericMinimize,
     GenericRestore,
+    Github,
+    Globe,
+    GitBranch,
     Hash,
     HistoryRerun,
     Indicator,
     IndicatorX,
+    Info,
     InlayHint,
+    Keyboard,
     Library,
     LineHeight,
     Link,
     ListTree,
-    MagicWand,
+    ListX,
     MagnifyingGlass,
     MailOpen,
     Maximize,
     Menu,
     MessageBubbles,
+    MessageCircle,
     Mic,
     MicMute,
+    Microscope,
     Minimize,
     Option,
     PageDown,
     PageUp,
+    PanelLeft,
+    PanelRight,
     Pencil,
     Person,
+    PhoneIncoming,
+    Pin,
     Play,
     Plus,
+    PocketKnife,
     Public,
     PullRequest,
     Quote,
+    RefreshTitle,
     Regex,
     ReplNeutral,
     Replace,
@@ -220,15 +250,20 @@ pub enum IconName {
     Reveal,
     RotateCcw,
     RotateCw,
+    Route,
     Save,
     Screen,
+    SearchCode,
     SearchSelection,
     SelectAll,
     Server,
     Settings,
+    SettingsAlt,
     Shift,
+    Slash,
+    SlashSquare,
     Sliders,
-    SlidersAlt,
+    SlidersVertical,
     Snip,
     Space,
     Sparkle,
@@ -236,6 +271,9 @@ pub enum IconName {
     SparkleFilled,
     Spinner,
     Split,
+    SquareDot,
+    SquareMinus,
+    SquarePlus,
     Star,
     StarFilled,
     Stop,
@@ -244,174 +282,36 @@ pub enum IconName {
     SupermavenDisabled,
     SupermavenError,
     SupermavenInit,
+    SwatchBook,
     Tab,
     Terminal,
-    TextCursor,
+    TextSnippet,
+    ThumbsUp,
+    ThumbsDown,
     Trash,
+    TrashAlt,
+    Triangle,
     TriangleRight,
+    Undo,
+    Unpin,
     Update,
+    UserGroup,
+    Visible,
+    Wand,
+    Warning,
     WholeWord,
+    X,
     XCircle,
     ZedAssistant,
+    ZedAssistant2,
     ZedAssistantFilled,
+    ZedPredict,
     ZedXCopilot,
-    Visible,
 }
 
-impl IconName {
-    pub fn path(self) -> &'static str {
-        match self {
-            IconName::Ai => "icons/ai.svg",
-            IconName::ArrowCircle => "icons/arrow_circle.svg",
-            IconName::ArrowDown => "icons/arrow_down.svg",
-            IconName::ArrowDownFromLine => "icons/arrow_down_from_line.svg",
-            IconName::ArrowLeft => "icons/arrow_left.svg",
-            IconName::ArrowRight => "icons/arrow_right.svg",
-            IconName::ArrowUp => "icons/arrow_up.svg",
-            IconName::ArrowUpFromLine => "icons/arrow_up_from_line.svg",
-            IconName::ArrowUpRight => "icons/arrow_up_right.svg",
-            IconName::AtSign => "icons/at_sign.svg",
-            IconName::AudioOff => "icons/speaker_off.svg",
-            IconName::AudioOn => "icons/speaker_loud.svg",
-            IconName::Backspace => "icons/backspace.svg",
-            IconName::Bell => "icons/bell.svg",
-            IconName::BellDot => "icons/bell_dot.svg",
-            IconName::BellOff => "icons/bell_off.svg",
-            IconName::BellRing => "icons/bell_ring.svg",
-            IconName::Bolt => "icons/bolt.svg",
-            IconName::Book => "icons/book.svg",
-            IconName::BookCopy => "icons/book_copy.svg",
-            IconName::BookPlus => "icons/book_plus.svg",
-            IconName::CaseSensitive => "icons/case_insensitive.svg",
-            IconName::Check => "icons/check.svg",
-            IconName::ChevronDown => "icons/chevron_down.svg",
-            IconName::ChevronDownSmall => "icons/chevron_down_small.svg",
-            IconName::ChevronLeft => "icons/chevron_left.svg",
-            IconName::ChevronRight => "icons/chevron_right.svg",
-            IconName::ChevronUp => "icons/chevron_up.svg",
-            IconName::ChevronUpDown => "icons/chevron_up_down.svg",
-            IconName::Close => "icons/x.svg",
-            IconName::Code => "icons/code.svg",
-            IconName::Collab => "icons/user_group_16.svg",
-            IconName::Command => "icons/command.svg",
-            IconName::Context => "icons/context.svg",
-            IconName::Control => "icons/control.svg",
-            IconName::Copilot => "icons/copilot.svg",
-            IconName::CopilotDisabled => "icons/copilot_disabled.svg",
-            IconName::CopilotError => "icons/copilot_error.svg",
-            IconName::CopilotInit => "icons/copilot_init.svg",
-            IconName::Copy => "icons/copy.svg",
-            IconName::CountdownTimer => "icons/countdown_timer.svg",
-            IconName::Dash => "icons/dash.svg",
-            IconName::Delete => "icons/delete.svg",
-            IconName::Disconnected => "icons/disconnected.svg",
-            IconName::Download => "icons/download.svg",
-            IconName::Ellipsis => "icons/ellipsis.svg",
-            IconName::Envelope => "icons/feedback.svg",
-            IconName::Escape => "icons/escape.svg",
-            IconName::ExclamationTriangle => "icons/warning.svg",
-            IconName::Exit => "icons/exit.svg",
-            IconName::ExpandVertical => "icons/expand_vertical.svg",
-            IconName::ExternalLink => "icons/external_link.svg",
-            IconName::Eye => "icons/eye.svg",
-            IconName::File => "icons/file.svg",
-            IconName::FileDoc => "icons/file_icons/book.svg",
-            IconName::FileGeneric => "icons/file_icons/file.svg",
-            IconName::FileGit => "icons/file_icons/git.svg",
-            IconName::FileLock => "icons/file_icons/lock.svg",
-            IconName::FileRust => "icons/file_icons/rust.svg",
-            IconName::FileToml => "icons/file_icons/toml.svg",
-            IconName::FileTree => "icons/project.svg",
-            IconName::FileCode => "icons/file_code.svg",
-            IconName::FileText => "icons/file_text.svg",
-            IconName::Filter => "icons/filter.svg",
-            IconName::Folder => "icons/file_icons/folder.svg",
-            IconName::FolderOpen => "icons/file_icons/folder_open.svg",
-            IconName::FolderX => "icons/stop_sharing.svg",
-            IconName::Font => "icons/font.svg",
-            IconName::FontSize => "icons/font_size.svg",
-            IconName::FontWeight => "icons/font_weight.svg",
-            IconName::Github => "icons/github.svg",
-            IconName::GenericMinimize => "icons/generic_minimize.svg",
-            IconName::GenericMaximize => "icons/generic_maximize.svg",
-            IconName::GenericClose => "icons/generic_close.svg",
-            IconName::GenericRestore => "icons/generic_restore.svg",
-            IconName::Hash => "icons/hash.svg",
-            IconName::HistoryRerun => "icons/history_rerun.svg",
-            IconName::Indicator => "icons/indicator.svg",
-            IconName::IndicatorX => "icons/indicator_x.svg",
-            IconName::InlayHint => "icons/inlay_hint.svg",
-            IconName::Library => "icons/library.svg",
-            IconName::LineHeight => "icons/line_height.svg",
-            IconName::Link => "icons/link.svg",
-            IconName::ListTree => "icons/list_tree.svg",
-            IconName::MagicWand => "icons/magic_wand.svg",
-            IconName::MagnifyingGlass => "icons/magnifying_glass.svg",
-            IconName::MailOpen => "icons/mail_open.svg",
-            IconName::Maximize => "icons/maximize.svg",
-            IconName::Menu => "icons/menu.svg",
-            IconName::MessageBubbles => "icons/conversations.svg",
-            IconName::Mic => "icons/mic.svg",
-            IconName::MicMute => "icons/mic_mute.svg",
-            IconName::Minimize => "icons/minimize.svg",
-            IconName::Option => "icons/option.svg",
-            IconName::PageDown => "icons/page_down.svg",
-            IconName::PageUp => "icons/page_up.svg",
-            IconName::Pencil => "icons/pencil.svg",
-            IconName::Person => "icons/person.svg",
-            IconName::Play => "icons/play.svg",
-            IconName::Plus => "icons/plus.svg",
-            IconName::Public => "icons/public.svg",
-            IconName::PullRequest => "icons/pull_request.svg",
-            IconName::Quote => "icons/quote.svg",
-            IconName::Regex => "icons/regex.svg",
-            IconName::ReplNeutral => "icons/repl_neutral.svg",
-            IconName::Replace => "icons/replace.svg",
-            IconName::ReplaceAll => "icons/replace_all.svg",
-            IconName::ReplaceNext => "icons/replace_next.svg",
-            IconName::ReplyArrowRight => "icons/reply_arrow_right.svg",
-            IconName::Rerun => "icons/rerun.svg",
-            IconName::Return => "icons/return.svg",
-            IconName::Reveal => "icons/reveal.svg",
-            IconName::RotateCcw => "icons/rotate_ccw.svg",
-            IconName::RotateCw => "icons/rotate_cw.svg",
-            IconName::Save => "icons/save.svg",
-            IconName::Screen => "icons/desktop.svg",
-            IconName::SearchSelection => "icons/search_selection.svg",
-            IconName::SelectAll => "icons/select_all.svg",
-            IconName::Server => "icons/server.svg",
-            IconName::Settings => "icons/file_icons/settings.svg",
-            IconName::Shift => "icons/shift.svg",
-            IconName::Sliders => "icons/sliders.svg",
-            IconName::SlidersAlt => "icons/sliders-alt.svg",
-            IconName::Snip => "icons/snip.svg",
-            IconName::Space => "icons/space.svg",
-            IconName::Sparkle => "icons/sparkle.svg",
-            IconName::SparkleAlt => "icons/sparkle_alt.svg",
-            IconName::SparkleFilled => "icons/sparkle_filled.svg",
-            IconName::Spinner => "icons/spinner.svg",
-            IconName::Split => "icons/split.svg",
-            IconName::Star => "icons/star.svg",
-            IconName::StarFilled => "icons/star_filled.svg",
-            IconName::Stop => "icons/stop.svg",
-            IconName::Strikethrough => "icons/strikethrough.svg",
-            IconName::Supermaven => "icons/supermaven.svg",
-            IconName::SupermavenDisabled => "icons/supermaven_disabled.svg",
-            IconName::SupermavenError => "icons/supermaven_error.svg",
-            IconName::SupermavenInit => "icons/supermaven_init.svg",
-            IconName::Tab => "icons/tab.svg",
-            IconName::Terminal => "icons/terminal.svg",
-            IconName::TextCursor => "icons/text-cursor.svg",
-            IconName::Trash => "icons/trash.svg",
-            IconName::TriangleRight => "icons/triangle_right.svg",
-            IconName::Update => "icons/update.svg",
-            IconName::WholeWord => "icons/word_search.svg",
-            IconName::XCircle => "icons/error.svg",
-            IconName::ZedAssistant => "icons/zed_assistant.svg",
-            IconName::ZedAssistantFilled => "icons/zed_assistant_filled.svg",
-            IconName::ZedXCopilot => "icons/zed_x_copilot.svg",
-            IconName::Visible => "icons/visible.svg",
-        }
+impl From<IconName> for Icon {
+    fn from(icon: IconName) -> Self {
+        Icon::new(icon)
     }
 }
 
@@ -477,77 +377,257 @@ impl RenderOnce for Icon {
     }
 }
 
-#[derive(IntoElement)]
-pub struct DecoratedIcon {
-    icon: Icon,
-    decoration: IconDecoration,
-    decoration_color: Color,
-    parent_background: Option<Hsla>,
+const ICON_DECORATION_SIZE: f32 = 11.0;
+
+/// An icon silhouette used to knockout the background of an element
+/// for an icon to sit on top of it, emulating a stroke/border.
+#[derive(Debug, PartialEq, Eq, Copy, Clone, EnumIter, EnumString, IntoStaticStr, DerivePathStr)]
+#[strum(serialize_all = "snake_case")]
+#[path_str(prefix = "icons/knockouts", suffix = ".svg")]
+pub enum KnockoutIconName {
+    // /icons/knockouts/x1.svg
+    XFg,
+    XBg,
+    DotFg,
+    DotBg,
+    TriangleFg,
+    TriangleBg,
 }
 
-impl DecoratedIcon {
-    pub fn new(icon: Icon, decoration: IconDecoration) -> Self {
-        Self {
-            icon,
-            decoration,
-            decoration_color: Color::Default,
-            parent_background: None,
+#[derive(Debug, PartialEq, Eq, Copy, Clone, EnumIter, EnumString)]
+pub enum IconDecorationKind {
+    // Slash,
+    X,
+    Dot,
+    Triangle,
+}
+
+impl IconDecorationKind {
+    fn fg(&self) -> KnockoutIconName {
+        match self {
+            Self::X => KnockoutIconName::XFg,
+            Self::Dot => KnockoutIconName::DotFg,
+            Self::Triangle => KnockoutIconName::TriangleFg,
         }
     }
 
-    pub fn decoration_color(mut self, color: Color) -> Self {
-        self.decoration_color = color;
+    fn bg(&self) -> KnockoutIconName {
+        match self {
+            Self::X => KnockoutIconName::XBg,
+            Self::Dot => KnockoutIconName::DotBg,
+            Self::Triangle => KnockoutIconName::TriangleBg,
+        }
+    }
+}
+
+/// The decoration for an icon.
+///
+/// For example, this can show an indicator, an "x",
+/// or a diagonal strikethrough to indicate something is disabled.
+#[derive(IntoElement)]
+pub struct IconDecoration {
+    kind: IconDecorationKind,
+    color: Hsla,
+    knockout_color: Hsla,
+    knockout_hover_color: Hsla,
+    position: Point<Pixels>,
+    group_name: Option<SharedString>,
+}
+
+impl IconDecoration {
+    /// Create a new icon decoration
+    pub fn new(kind: IconDecorationKind, knockout_color: Hsla, cx: &WindowContext) -> Self {
+        let color = cx.theme().colors().icon;
+        let position = Point::default();
+
+        Self {
+            kind,
+            color,
+            knockout_color,
+            knockout_hover_color: knockout_color,
+            position,
+            group_name: None,
+        }
+    }
+
+    /// Sets the kind of decoration
+    pub fn kind(mut self, kind: IconDecorationKind) -> Self {
+        self.kind = kind;
         self
     }
 
-    pub fn parent_background(mut self, background: Option<Hsla>) -> Self {
-        self.parent_background = background;
+    /// Sets the color of the decoration
+    pub fn color(mut self, color: Hsla) -> Self {
+        self.color = color;
         self
+    }
+
+    /// Sets the color of the decoration's knockout
+    ///
+    /// Match this to the background of the element
+    /// the icon will be rendered on
+    pub fn knockout_color(mut self, color: Hsla) -> Self {
+        self.knockout_color = color;
+        self
+    }
+
+    /// Sets the color of the decoration that is used on hover
+    pub fn knockout_hover_color(mut self, color: Hsla) -> Self {
+        self.knockout_hover_color = color;
+        self
+    }
+
+    /// Sets the position of the decoration
+    pub fn position(mut self, position: Point<Pixels>) -> Self {
+        self.position = position;
+        self
+    }
+
+    /// Sets the name of the group the decoration belongs to
+    pub fn group_name(mut self, name: Option<SharedString>) -> Self {
+        self.group_name = name;
+        self
+    }
+}
+
+impl RenderOnce for IconDecoration {
+    fn render(self, _cx: &mut WindowContext) -> impl IntoElement {
+        div()
+            .size(px(ICON_DECORATION_SIZE))
+            .flex_none()
+            .absolute()
+            .bottom(self.position.y)
+            .right(self.position.x)
+            .child(
+                // foreground
+                svg()
+                    .absolute()
+                    .bottom_0()
+                    .right_0()
+                    .size(px(ICON_DECORATION_SIZE))
+                    .path(self.kind.fg().path())
+                    .text_color(self.color),
+            )
+            .child(
+                // background
+                svg()
+                    .absolute()
+                    .bottom_0()
+                    .right_0()
+                    .size(px(ICON_DECORATION_SIZE))
+                    .path(self.kind.bg().path())
+                    .text_color(self.knockout_color)
+                    .when(self.group_name.is_none(), |this| {
+                        this.hover(|style| style.text_color(self.knockout_hover_color))
+                    })
+                    .when_some(self.group_name.clone(), |this, group_name| {
+                        this.group_hover(group_name, |style| {
+                            style.text_color(self.knockout_hover_color)
+                        })
+                    }),
+            )
+    }
+}
+
+impl ComponentPreview for IconDecoration {
+    fn examples(cx: &mut WindowContext) -> Vec<ComponentExampleGroup<Self>> {
+        let all_kinds = IconDecorationKind::iter().collect::<Vec<_>>();
+
+        let examples = all_kinds
+            .iter()
+            .map(|kind| {
+                let name = format!("{:?}", kind).to_string();
+
+                single_example(
+                    name,
+                    IconDecoration::new(*kind, cx.theme().colors().surface_background, cx),
+                )
+            })
+            .collect();
+
+        vec![example_group(examples)]
+    }
+}
+
+#[derive(IntoElement)]
+pub struct DecoratedIcon {
+    icon: Icon,
+    decoration: Option<IconDecoration>,
+}
+
+impl DecoratedIcon {
+    pub fn new(icon: Icon, decoration: Option<IconDecoration>) -> Self {
+        Self { icon, decoration }
     }
 }
 
 impl RenderOnce for DecoratedIcon {
-    fn render(self, cx: &mut WindowContext) -> impl IntoElement {
-        let background = self
-            .parent_background
-            .unwrap_or(cx.theme().colors().background);
-
-        let size = self.icon.size;
-
-        let decoration_icon = match self.decoration {
-            IconDecoration::Strikethrough => IconName::Strikethrough,
-            IconDecoration::IndicatorDot => IconName::Indicator,
-            IconDecoration::X => IconName::IndicatorX,
-        };
-
-        let decoration_svg = |icon: IconName| {
-            svg()
-                .absolute()
-                .top_0()
-                .left_0()
-                .path(icon.path())
-                .size(size)
-                .flex_none()
-                .text_color(self.decoration_color.color(cx))
-        };
-
-        let decoration_knockout = |icon: IconName| {
-            svg()
-                .absolute()
-                .top(-rems_from_px(2.))
-                .left(-rems_from_px(3.))
-                .path(icon.path())
-                .size(size + rems_from_px(2.))
-                .flex_none()
-                .text_color(background)
-        };
-
+    fn render(self, _cx: &mut WindowContext) -> impl IntoElement {
         div()
             .relative()
             .size(self.icon.size)
             .child(self.icon)
-            .child(decoration_knockout(decoration_icon))
-            .child(decoration_svg(decoration_icon))
+            .when_some(self.decoration, |this, decoration| this.child(decoration))
+    }
+}
+
+impl ComponentPreview for DecoratedIcon {
+    fn examples(cx: &mut WindowContext) -> Vec<ComponentExampleGroup<Self>> {
+        let icon_1 = Icon::new(IconName::FileDoc);
+        let icon_2 = Icon::new(IconName::FileDoc);
+        let icon_3 = Icon::new(IconName::FileDoc);
+        let icon_4 = Icon::new(IconName::FileDoc);
+
+        let decoration_x = IconDecoration::new(
+            IconDecorationKind::X,
+            cx.theme().colors().surface_background,
+            cx,
+        )
+        .color(cx.theme().status().error)
+        .position(Point {
+            x: px(-2.),
+            y: px(-2.),
+        });
+
+        let decoration_triangle = IconDecoration::new(
+            IconDecorationKind::Triangle,
+            cx.theme().colors().surface_background,
+            cx,
+        )
+        .color(cx.theme().status().error)
+        .position(Point {
+            x: px(-2.),
+            y: px(-2.),
+        });
+
+        let decoration_dot = IconDecoration::new(
+            IconDecorationKind::Dot,
+            cx.theme().colors().surface_background,
+            cx,
+        )
+        .color(cx.theme().status().error)
+        .position(Point {
+            x: px(-2.),
+            y: px(-2.),
+        });
+
+        let examples = vec![
+            single_example("no_decoration", DecoratedIcon::new(icon_1, None)),
+            single_example(
+                "with_decoration",
+                DecoratedIcon::new(icon_2, Some(decoration_x)),
+            ),
+            single_example(
+                "with_decoration",
+                DecoratedIcon::new(icon_3, Some(decoration_triangle)),
+            ),
+            single_example(
+                "with_decoration",
+                DecoratedIcon::new(icon_4, Some(decoration_dot)),
+            ),
+        ];
+
+        vec![example_group(examples)]
     }
 }
 
@@ -598,15 +678,37 @@ impl RenderOnce for IconWithIndicator {
                 this.child(
                     div()
                         .absolute()
-                        .w_2()
-                        .h_2()
-                        .border_1()
+                        .size_2p5()
+                        .border_2()
                         .border_color(indicator_border_color)
                         .rounded_full()
                         .bottom_neg_0p5()
-                        .right_neg_1()
+                        .right_neg_0p5()
                         .child(indicator),
                 )
             })
+    }
+}
+
+impl ComponentPreview for Icon {
+    fn examples(_cx: &mut WindowContext) -> Vec<ComponentExampleGroup<Icon>> {
+        let arrow_icons = vec![
+            IconName::ArrowDown,
+            IconName::ArrowLeft,
+            IconName::ArrowRight,
+            IconName::ArrowUp,
+            IconName::ArrowCircle,
+        ];
+
+        vec![example_group_with_title(
+            "Arrow Icons",
+            arrow_icons
+                .into_iter()
+                .map(|icon| {
+                    let name = format!("{:?}", icon).to_string();
+                    ComponentExample::new(name, Icon::new(icon))
+                })
+                .collect(),
+        )]
     }
 }

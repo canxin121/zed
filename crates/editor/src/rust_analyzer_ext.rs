@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fs, path::Path};
 
 use anyhow::Context as _;
 use gpui::{Context, View, ViewContext, VisualContext, WindowContext};
@@ -7,30 +7,33 @@ use multi_buffer::MultiBuffer;
 use project::lsp_ext_command::ExpandMacro;
 use text::ToPointUtf16;
 
-use crate::{element::register_action, Editor, ExpandMacroRecursively};
+use crate::{
+    element::register_action, lsp_ext::find_specific_language_server_in_selection, Editor,
+    ExpandMacroRecursively, OpenDocs,
+};
+
+const RUST_ANALYZER_NAME: &str = "rust-analyzer";
+
+fn is_rust_language(language: &Language) -> bool {
+    language.name() == "Rust".into()
+}
 
 pub fn apply_related_actions(editor: &View<Editor>, cx: &mut WindowContext) {
-    let is_rust_related = editor.update(cx, |editor, cx| {
-        editor
-            .buffer()
-            .read(cx)
-            .all_buffers()
-            .iter()
-            .any(|b| match b.read(cx).language() {
-                Some(l) => is_rust_language(l),
-                None => false,
-            })
-    });
-
-    if is_rust_related {
+    if editor
+        .update(cx, |e, cx| {
+            find_specific_language_server_in_selection(e, cx, is_rust_language, RUST_ANALYZER_NAME)
+        })
+        .is_some()
+    {
         register_action(editor, cx, expand_macro_recursively);
+        register_action(editor, cx, open_docs);
     }
 }
 
 pub fn expand_macro_recursively(
     editor: &mut Editor,
     _: &ExpandMacroRecursively,
-    cx: &mut ViewContext<'_, Editor>,
+    cx: &mut ViewContext<Editor>,
 ) {
     if editor.selections.count() == 0 {
         return;
@@ -42,39 +45,13 @@ pub fn expand_macro_recursively(
         return;
     };
 
-    let multibuffer = editor.buffer().read(cx);
-
-    let Some((trigger_anchor, rust_language, server_to_query, buffer)) = editor
-        .selections
-        .disjoint_anchors()
-        .into_iter()
-        .filter(|selection| selection.start == selection.end)
-        .filter_map(|selection| Some((selection.start.buffer_id?, selection.start)))
-        .filter_map(|(buffer_id, trigger_anchor)| {
-            let buffer = multibuffer.buffer(buffer_id)?;
-            let rust_language = buffer.read(cx).language_at(trigger_anchor.text_anchor)?;
-            if !is_rust_language(&rust_language) {
-                return None;
-            }
-            Some((trigger_anchor, rust_language, buffer))
-        })
-        .find_map(|(trigger_anchor, rust_language, buffer)| {
-            project
-                .read(cx)
-                .language_servers_for_buffer(buffer.read(cx), cx)
-                .find_map(|(adapter, server)| {
-                    if adapter.name.0.as_ref() == "rust-analyzer" {
-                        Some((
-                            trigger_anchor,
-                            Arc::clone(&rust_language),
-                            server.server_id(),
-                            buffer.clone(),
-                        ))
-                    } else {
-                        None
-                    }
-                })
-        })
+    let Some((trigger_anchor, rust_language, server_to_query, buffer)) =
+        find_specific_language_server_in_selection(
+            editor,
+            cx,
+            is_rust_language,
+            RUST_ANALYZER_NAME,
+        )
     else {
         return;
     };
@@ -121,6 +98,63 @@ pub fn expand_macro_recursively(
     .detach_and_log_err(cx);
 }
 
-fn is_rust_language(language: &Language) -> bool {
-    language.name().as_ref() == "Rust"
+pub fn open_docs(editor: &mut Editor, _: &OpenDocs, cx: &mut ViewContext<Editor>) {
+    if editor.selections.count() == 0 {
+        return;
+    }
+    let Some(project) = &editor.project else {
+        return;
+    };
+    let Some(workspace) = editor.workspace() else {
+        return;
+    };
+
+    let Some((trigger_anchor, _rust_language, server_to_query, buffer)) =
+        find_specific_language_server_in_selection(
+            editor,
+            cx,
+            is_rust_language,
+            RUST_ANALYZER_NAME,
+        )
+    else {
+        return;
+    };
+
+    let project = project.clone();
+    let buffer_snapshot = buffer.read(cx).snapshot();
+    let position = trigger_anchor.text_anchor.to_point_utf16(&buffer_snapshot);
+    let open_docs_task = project.update(cx, |project, cx| {
+        project.request_lsp(
+            buffer,
+            project::LanguageServerToQuery::Other(server_to_query),
+            project::lsp_ext_command::OpenDocs { position },
+            cx,
+        )
+    });
+
+    cx.spawn(|_editor, mut cx| async move {
+        let docs_urls = open_docs_task.await.context("open docs")?;
+        if docs_urls.is_empty() {
+            log::debug!("Empty docs urls for position {position:?}");
+            return Ok(());
+        } else {
+            log::debug!("{:?}", docs_urls);
+        }
+
+        workspace.update(&mut cx, |_workspace, cx| {
+            // Check if the local document exists, otherwise fallback to the online document.
+            // Open with the default browser.
+            if let Some(local_url) = docs_urls.local {
+                if fs::metadata(Path::new(&local_url[8..])).is_ok() {
+                    cx.open_url(&local_url);
+                    return;
+                }
+            }
+
+            if let Some(web_url) = docs_urls.web {
+                cx.open_url(&web_url);
+            }
+        })
+    })
+    .detach_and_log_err(cx);
 }

@@ -1,11 +1,12 @@
 use crate::{
-    point, px, size, Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics,
-    FontRun, FontStyle, FontWeight, GlyphId, LineLayout, Pixels, PlatformTextSystem, Point,
-    RenderGlyphParams, Result, ShapedGlyph, ShapedRun, SharedString, Size, SUBPIXEL_VARIANTS,
+    point, px, size, swap_rgba_pa_to_bgra, Bounds, DevicePixels, Font, FontFallbacks, FontFeatures,
+    FontId, FontMetrics, FontRun, FontStyle, FontWeight, GlyphId, LineLayout, Pixels,
+    PlatformTextSystem, Point, RenderGlyphParams, Result, ShapedGlyph, ShapedRun, SharedString,
+    Size, SUBPIXEL_VARIANTS,
 };
 use anyhow::anyhow;
-use cocoa::appkit::{CGFloat, CGPoint};
-use collections::{BTreeSet, HashMap};
+use cocoa::appkit::CGFloat;
+use collections::HashMap;
 use core_foundation::{
     attributed_string::CFMutableAttributedString,
     base::{CFRange, TCFType},
@@ -16,6 +17,7 @@ use core_graphics::{
     base::{kCGImageAlphaPremultipliedLast, CGGlyph},
     color_space::CGColorSpace,
     context::CGContext,
+    display::CGPoint,
 };
 use core_text::{
     font::CTFont,
@@ -93,26 +95,18 @@ impl PlatformTextSystem for MacTextSystem {
     }
 
     fn all_font_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
         let collection = core_text::font_collection::create_for_all_families();
         let Some(descriptors) = collection.get_descriptors() else {
-            return Vec::new();
+            return names;
         };
-        let mut names = BTreeSet::new();
         for descriptor in descriptors.into_iter() {
             names.extend(lenient_font_attributes::family_name(&descriptor));
         }
         if let Ok(fonts_in_memory) = self.0.read().memory_source.all_families() {
             names.extend(fonts_in_memory);
         }
-        names.into_iter().collect()
-    }
-
-    fn all_font_families(&self) -> Vec<String> {
-        self.0
-            .read()
-            .system_source
-            .all_families()
-            .expect("core text should never return an error")
+        names
     }
 
     fn font_id(&self, font: &Font) -> Result<FontId> {
@@ -425,11 +419,7 @@ impl MacTextSystemState {
             if params.is_emoji {
                 // Convert from RGBA with premultiplied alpha to BGRA with straight alpha.
                 for pixel in bytes.chunks_exact_mut(4) {
-                    pixel.swap(0, 2);
-                    let a = pixel[3] as f32 / 255.;
-                    pixel[0] = (pixel[0] as f32 / a) as u8;
-                    pixel[1] = (pixel[1] as f32 / a) as u8;
-                    pixel[2] = (pixel[2] as f32 / a) as u8;
+                    swap_rgba_pa_to_bgra(pixel);
                 }
             }
 
@@ -477,9 +467,10 @@ impl MacTextSystemState {
 
         // Retrieve the glyphs from the shaped line, converting UTF16 offsets to UTF8 offsets.
         let line = CTLine::new_with_attributed_string(string.as_concrete_TypeRef());
-
-        let mut runs = Vec::new();
-        for run in line.glyph_runs().into_iter() {
+        let glyph_runs = line.glyph_runs();
+        let mut runs = Vec::with_capacity(glyph_runs.len() as usize);
+        let mut ix_converter = StringIndexConverter::new(text);
+        for run in glyph_runs.into_iter() {
             let attributes = run.attributes().unwrap();
             let font = unsafe {
                 attributes
@@ -489,7 +480,6 @@ impl MacTextSystemState {
             };
             let font_id = self.id_for_native_font(font);
 
-            let mut ix_converter = StringIndexConverter::new(text);
             let mut glyphs = SmallVec::new();
             for ((glyph_id, position), glyph_utf16_ix) in run
                 .glyphs()
@@ -498,6 +488,10 @@ impl MacTextSystemState {
                 .zip(run.string_indices().iter())
             {
                 let glyph_utf16_ix = usize::try_from(*glyph_utf16_ix).unwrap();
+                if ix_converter.utf16_ix > glyph_utf16_ix {
+                    // We cannot reuse current index converter, as it can only seek forward. Restart the search.
+                    ix_converter = StringIndexConverter::new(text);
+                }
                 ix_converter.advance_to_utf16_ix(glyph_utf16_ix);
                 glyphs.push(ShapedGlyph {
                     id: GlyphId(*glyph_id as u32),
@@ -507,9 +501,8 @@ impl MacTextSystemState {
                 });
             }
 
-            runs.push(ShapedRun { font_id, glyphs })
+            runs.push(ShapedRun { font_id, glyphs });
         }
-
         let typographic_bounds = line.get_typographic_bounds();
         LineLayout {
             runs,

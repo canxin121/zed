@@ -15,7 +15,7 @@ use language::{
 use lsp::FakeLanguageServer;
 use pretty_assertions::assert_eq;
 use project::{
-    search::SearchQuery, Project, ProjectPath, SearchResult, DEFAULT_COMPLETION_CONTEXT,
+    search::SearchQuery, search::SearchResult, Project, ProjectPath, DEFAULT_COMPLETION_CONTEXT,
 };
 use rand::{
     distributions::{Alphanumeric, DistString},
@@ -282,7 +282,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                             let mut paths = client.fs().paths(false);
                             paths.remove(0);
                             let new_root_path = if paths.is_empty() || rng.gen() {
-                                Path::new("/").join(&plan.next_root_dir_name())
+                                Path::new("/").join(plan.next_root_dir_name())
                             } else {
                                 paths.choose(rng).unwrap().clone()
                             };
@@ -835,7 +835,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                         .map_ok(|_| ())
                         .boxed(),
                     LspRequestKind::CodeAction => project
-                        .code_actions(&buffer, offset..offset, cx)
+                        .code_actions(&buffer, offset..offset, None, cx)
                         .map(|_| Ok(()))
                         .boxed(),
                     LspRequestKind::Definition => project
@@ -882,6 +882,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                             false,
                             Default::default(),
                             Default::default(),
+                            None,
                         )
                         .unwrap(),
                         cx,
@@ -1045,7 +1046,7 @@ impl RandomizedTest for ProjectCollaborationTest {
             },
             None,
         )));
-        client.language_registry().register_fake_lsp_adapter(
+        client.language_registry().register_fake_lsp(
             "Rust",
             FakeLspAdapter {
                 name: "the-fake-language-server",
@@ -1167,7 +1168,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                             Some((project, cx))
                         });
 
-                        if !guest_project.is_disconnected() {
+                        if !guest_project.is_disconnected(cx) {
                             if let Some((host_project, host_cx)) = host_project {
                                 let host_worktree_snapshots =
                                     host_project.read_with(host_cx, |host_project, cx| {
@@ -1253,8 +1254,8 @@ impl RandomizedTest for ProjectCollaborationTest {
 
             let buffers = client.buffers().clone();
             for (guest_project, guest_buffers) in &buffers {
-                let project_id = if guest_project.read_with(client_cx, |project, _| {
-                    project.is_local() || project.is_disconnected()
+                let project_id = if guest_project.read_with(client_cx, |project, cx| {
+                    project.is_local() || project.is_disconnected(cx)
                 }) {
                     continue;
                 } else {
@@ -1322,11 +1323,8 @@ impl RandomizedTest for ProjectCollaborationTest {
                     match (host_file, guest_file) {
                         (Some(host_file), Some(guest_file)) => {
                             assert_eq!(guest_file.path(), host_file.path());
-                            assert_eq!(guest_file.is_deleted(), host_file.is_deleted());
-                            assert_eq!(
-                                guest_file.mtime(),
-                                host_file.mtime(),
-                                "guest {} mtime does not match host {} for path {:?} in project {}",
+                            assert_eq!(guest_file.disk_state(), host_file.disk_state(),
+                                "guest {} disk_state does not match host {} for path {:?} in project {}",
                                 guest_user_id,
                                 host_user_id,
                                 guest_file.path(),
@@ -1338,10 +1336,24 @@ impl RandomizedTest for ProjectCollaborationTest {
                         (_, None) => panic!("guest's file is None, hosts's isn't"),
                     }
 
-                    let host_diff_base = host_buffer
-                        .read_with(host_cx, |b, _| b.diff_base().map(ToString::to_string));
-                    let guest_diff_base = guest_buffer
-                        .read_with(client_cx, |b, _| b.diff_base().map(ToString::to_string));
+                    let host_diff_base = host_project.read_with(host_cx, |project, cx| {
+                        project
+                            .buffer_store()
+                            .read(cx)
+                            .get_unstaged_changes(host_buffer.read(cx).remote_id())
+                            .unwrap()
+                            .read(cx)
+                            .base_text_string(cx)
+                    });
+                    let guest_diff_base = guest_project.read_with(client_cx, |project, cx| {
+                        project
+                            .buffer_store()
+                            .read(cx)
+                            .get_unstaged_changes(guest_buffer.read(cx).remote_id())
+                            .unwrap()
+                            .read(cx)
+                            .base_text_string(cx)
+                    });
                     assert_eq!(
                             guest_diff_base, host_diff_base,
                             "guest {} diff base does not match host's for path {path:?} in project {project_id}",

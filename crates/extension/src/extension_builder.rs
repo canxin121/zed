@@ -1,6 +1,6 @@
-use crate::wasm_host::parse_wasm_extension_version;
-use crate::ExtensionManifest;
-use crate::{extension_manifest::ExtensionLibraryKind, GrammarManifestEntry};
+use crate::{
+    parse_wasm_extension_version, ExtensionLibraryKind, ExtensionManifest, GrammarManifestEntry,
+};
 use anyhow::{anyhow, bail, Context as _, Result};
 use async_compression::futures::bufread::GzipDecoder;
 use async_tar::Archive;
@@ -11,20 +11,20 @@ use serde::Deserialize;
 use std::{
     env, fs, mem,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::Arc,
 };
 use wasm_encoder::{ComponentSectionId, Encode as _, RawSection, Section as _};
 use wasmparser::Parser;
 use wit_component::ComponentEncoder;
 
-/// Currently, we compile with Rust's `wasm32-wasi` target, which works with WASI `preview1`.
+/// Currently, we compile with Rust's `wasm32-wasip1` target, which works with WASI `preview1`.
 /// But the WASM component model is based on WASI `preview2`. So we need an 'adapter' WASM
 /// module, which implements the `preview1` interface in terms of `preview2`.
 ///
 /// Once Rust 1.78 is released, there will be a `wasm32-wasip2` target available, so we will
 /// not need the adapter anymore.
-const RUST_TARGET: &str = "wasm32-wasi";
+const RUST_TARGET: &str = "wasm32-wasip1";
 const WASI_ADAPTER_URL: &str =
     "https://github.com/bytecodealliance/wasmtime/releases/download/v18.0.2/wasi_snapshot_preview1.reactor.wasm";
 
@@ -36,7 +36,7 @@ const WASI_ADAPTER_URL: &str =
 const WASI_SDK_URL: &str = "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-21/";
 const WASI_SDK_ASSET_NAME: Option<&str> = if cfg!(target_os = "macos") {
     Some("wasi-sdk-21.0-macos.tar.gz")
-} else if cfg!(target_os = "linux") {
+} else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
     Some("wasi-sdk-21.0-linux.tar.gz")
 } else if cfg!(target_os = "windows") {
     Some("wasi-sdk-21.0.m-mingw.tar.gz")
@@ -77,7 +77,7 @@ impl ExtensionBuilder {
         extension_manifest: &mut ExtensionManifest,
         options: CompileExtensionOptions,
     ) -> Result<()> {
-        populate_defaults(extension_manifest, &extension_dir)?;
+        populate_defaults(extension_manifest, extension_dir)?;
 
         if extension_dir.is_relative() {
             bail!(
@@ -93,12 +93,21 @@ impl ExtensionBuilder {
             self.compile_rust_extension(extension_dir, extension_manifest, options)
                 .await
                 .context("failed to compile Rust extension")?;
+            log::info!("compiled Rust extension {}", extension_dir.display());
         }
 
         for (grammar_name, grammar_metadata) in &extension_manifest.grammars {
+            log::info!(
+                "compiling grammar {grammar_name} for extension {}",
+                extension_dir.display()
+            );
             self.compile_grammar(extension_dir, grammar_name.as_ref(), grammar_metadata)
                 .await
                 .with_context(|| format!("failed to compile grammar '{grammar_name}'"))?;
+            log::info!(
+                "compiled grammar {grammar_name} for extension {}",
+                extension_dir.display()
+            );
         }
 
         log::info!("finished compiling extension {}", extension_dir.display());
@@ -114,16 +123,21 @@ impl ExtensionBuilder {
         self.install_rust_wasm_target_if_needed()?;
         let adapter_bytes = self.install_wasi_preview1_adapter_if_needed().await?;
 
-        let cargo_toml_content = fs::read_to_string(&extension_dir.join("Cargo.toml"))?;
+        let cargo_toml_content = fs::read_to_string(extension_dir.join("Cargo.toml"))?;
         let cargo_toml: CargoToml = toml::from_str(&cargo_toml_content)?;
 
-        log::info!("compiling rust extension {}", extension_dir.display());
-        let output = Command::new("cargo")
+        log::info!(
+            "compiling Rust crate for extension {}",
+            extension_dir.display()
+        );
+        let output = util::command::new_std_command("cargo")
             .args(["build", "--target", RUST_TARGET])
             .args(options.release.then_some("--release"))
             .arg("--target-dir")
             .arg(extension_dir.join("target"))
-            .current_dir(&extension_dir)
+            // WASI builds do not work with sccache and just stuck, so disable it.
+            .env("RUSTC_WRAPPER", "")
+            .current_dir(extension_dir)
             .output()
             .context("failed to run `cargo`")?;
         if !output.status.success() {
@@ -133,6 +147,11 @@ impl ExtensionBuilder {
             );
         }
 
+        log::info!(
+            "compiled Rust crate for extension {}",
+            extension_dir.display()
+        );
+
         let mut wasm_path = PathBuf::from(extension_dir);
         wasm_path.extend([
             "target",
@@ -141,7 +160,7 @@ impl ExtensionBuilder {
             &cargo_toml
                 .package
                 .name
-                // The wasm32-wasi target normalizes `-` in package names to `_` in the resulting `.wasm` file.
+                // The wasm32-wasip1 target normalizes `-` in package names to `_` in the resulting `.wasm` file.
                 .replace('-', "_"),
         ]);
         wasm_path.set_extension("wasm");
@@ -154,6 +173,11 @@ impl ExtensionBuilder {
             .adapter("wasi_snapshot_preview1", &adapter_bytes)
             .context("failed to load adapter module")?
             .validate(true);
+
+        log::info!(
+            "encoding wasm component for extension {}",
+            extension_dir.display()
+        );
 
         let component_bytes = encoder
             .encode()
@@ -168,8 +192,15 @@ impl ExtensionBuilder {
                 .context("compiled wasm did not contain a valid zed extension api version")?;
         manifest.lib.version = Some(wasm_extension_api_version);
 
-        fs::write(extension_dir.join("extension.wasm"), &component_bytes)
+        let extension_file = extension_dir.join("extension.wasm");
+        fs::write(extension_file.clone(), &component_bytes)
             .context("failed to write extension.wasm")?;
+
+        log::info!(
+            "extension {} written to {}",
+            extension_dir.display(),
+            extension_file.display()
+        );
 
         Ok(())
     }
@@ -206,7 +237,7 @@ impl ExtensionBuilder {
         let scanner_path = src_path.join("scanner.c");
 
         log::info!("compiling {grammar_name} parser");
-        let clang_output = Command::new(&clang_path)
+        let clang_output = util::command::new_std_command(&clang_path)
             .args(["-fPIC", "-shared", "-Os"])
             .arg(format!("-Wl,--export=tree_sitter_{grammar_name}"))
             .arg("-o")
@@ -217,6 +248,7 @@ impl ExtensionBuilder {
             .args(scanner_path.exists().then_some(scanner_path))
             .output()
             .context("failed to run clang")?;
+
         if !clang_output.status.success() {
             bail!(
                 "failed to compile {} parser with clang: {}",
@@ -232,7 +264,7 @@ impl ExtensionBuilder {
         let git_dir = directory.join(".git");
 
         if directory.exists() {
-            let remotes_output = Command::new("git")
+            let remotes_output = util::command::new_std_command("git")
                 .arg("--git-dir")
                 .arg(&git_dir)
                 .args(["remote", "-v"])
@@ -252,12 +284,12 @@ impl ExtensionBuilder {
                 );
             }
         } else {
-            fs::create_dir_all(&directory).with_context(|| {
+            fs::create_dir_all(directory).with_context(|| {
                 format!("failed to create grammar directory {}", directory.display(),)
             })?;
-            let init_output = Command::new("git")
+            let init_output = util::command::new_std_command("git")
                 .arg("init")
-                .current_dir(&directory)
+                .current_dir(directory)
                 .output()?;
             if !init_output.status.success() {
                 bail!(
@@ -266,7 +298,7 @@ impl ExtensionBuilder {
                 );
             }
 
-            let remote_add_output = Command::new("git")
+            let remote_add_output = util::command::new_std_command("git")
                 .arg("--git-dir")
                 .arg(&git_dir)
                 .args(["remote", "add", "origin", url])
@@ -280,18 +312,18 @@ impl ExtensionBuilder {
             }
         }
 
-        let fetch_output = Command::new("git")
+        let fetch_output = util::command::new_std_command("git")
             .arg("--git-dir")
             .arg(&git_dir)
-            .args(["fetch", "--depth", "1", "origin", &rev])
+            .args(["fetch", "--depth", "1", "origin", rev])
             .output()
             .context("failed to execute `git fetch`")?;
 
-        let checkout_output = Command::new("git")
+        let checkout_output = util::command::new_std_command("git")
             .arg("--git-dir")
             .arg(&git_dir)
-            .args(["checkout", &rev])
-            .current_dir(&directory)
+            .args(["checkout", rev])
+            .current_dir(directory)
             .output()
             .context("failed to execute `git checkout`")?;
         if !checkout_output.status.success() {
@@ -314,7 +346,7 @@ impl ExtensionBuilder {
     }
 
     fn install_rust_wasm_target_if_needed(&self) -> Result<()> {
-        let rustc_output = Command::new("rustc")
+        let rustc_output = util::command::new_std_command("rustc")
             .arg("--print")
             .arg("sysroot")
             .output()
@@ -331,14 +363,17 @@ impl ExtensionBuilder {
             return Ok(());
         }
 
-        let output = Command::new("rustup")
+        let output = util::command::new_std_command("rustup")
             .args(["target", "add", RUST_TARGET])
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .stdout(Stdio::inherit())
             .output()
             .context("failed to run `rustup target add`")?;
         if !output.status.success() {
-            bail!("failed to install the `{RUST_TARGET}` target");
+            bail!(
+                "failed to install the `{RUST_TARGET}` target: {}",
+                String::from_utf8_lossy(&rustc_output.stderr)
+            );
         }
 
         Ok(())
@@ -402,6 +437,7 @@ impl ExtensionBuilder {
         let body = BufReader::new(response.body_mut());
         let body = GzipDecoder::new(body);
         let tar = Archive::new(body);
+
         tar.unpack(&tar_out_dir)
             .await
             .context("failed to unpack wasi-sdk archive")?;
@@ -418,7 +454,7 @@ impl ExtensionBuilder {
     }
 
     // This was adapted from:
-    // https://github.com/bytecodealliance/wasm-tools/1791a8f139722e9f8679a2bd3d8e423e55132b22/src/bin/wasm-tools/strip.rs
+    // https://github.com/bytecodealliance/wasm-tools/blob/1791a8f139722e9f8679a2bd3d8e423e55132b22/src/bin/wasm-tools/strip.rs
     fn strip_custom_sections(&self, input: &Vec<u8>) -> Result<Vec<u8>> {
         use wasmparser::Payload::*;
 
@@ -429,13 +465,15 @@ impl ExtensionBuilder {
 
         for payload in Parser::new(0).parse_all(input) {
             let payload = payload?;
+            let component_header = wasm_encoder::Component::HEADER;
+            let module_header = wasm_encoder::Module::HEADER;
 
             // Track nesting depth, so that we don't mess with inner producer sections:
             match payload {
                 Version { encoding, .. } => {
                     output.extend_from_slice(match encoding {
-                        wasmparser::Encoding::Component => &wasm_encoder::Component::HEADER,
-                        wasmparser::Encoding::Module => &wasm_encoder::Module::HEADER,
+                        wasmparser::Encoding::Component => &component_header,
+                        wasmparser::Encoding::Module => &module_header,
                     });
                 }
                 ModuleSection { .. } | ComponentSection { .. } => {
@@ -447,7 +485,7 @@ impl ExtensionBuilder {
                         Some(c) => c,
                         None => break,
                     };
-                    if output.starts_with(&wasm_encoder::Component::HEADER) {
+                    if output.starts_with(&component_header) {
                         parent.push(ComponentSectionId::Component as u8);
                         output.encode(&mut parent);
                     } else {
@@ -459,14 +497,10 @@ impl ExtensionBuilder {
                 _ => {}
             }
 
-            match &payload {
-                CustomSection(c) => {
-                    if strip_custom_section(c.name()) {
-                        continue;
-                    }
+            if let CustomSection(c) = &payload {
+                if strip_custom_section(c.name()) {
+                    continue;
                 }
-
-                _ => {}
             }
 
             if let Some((id, range)) = payload.as_section() {

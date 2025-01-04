@@ -13,9 +13,10 @@ use editor::{
 };
 use futures::channel::oneshot;
 use gpui::{
-    actions, div, impl_actions, Action, AppContext, ClickEvent, EventEmitter, FocusableView, Hsla,
-    InteractiveElement as _, IntoElement, KeyContext, ParentElement as _, Render, ScrollHandle,
-    Styled, Subscription, Task, TextStyle, View, ViewContext, VisualContext as _, WindowContext,
+    actions, div, impl_actions, Action, AppContext, ClickEvent, EventEmitter, FocusHandle,
+    FocusableView, Hsla, InteractiveElement as _, IntoElement, KeyContext, ParentElement as _,
+    Render, ScrollHandle, Styled, Subscription, Task, TextStyle, View, ViewContext,
+    VisualContext as _, WindowContext,
 };
 use project::{
     search::SearchQuery,
@@ -26,7 +27,10 @@ use settings::Settings;
 use std::sync::Arc;
 use theme::ThemeSettings;
 
-use ui::{h_flex, prelude::*, IconButton, IconName, Tooltip, BASE_REM_SIZE_IN_PX};
+use ui::{
+    h_flex, prelude::*, utils::SearchInputWidth, IconButton, IconButtonShape, IconName, Tooltip,
+    BASE_REM_SIZE_IN_PX,
+};
 use util::ResultExt;
 use workspace::{
     item::ItemHandle,
@@ -37,8 +41,6 @@ use workspace::{
 pub use registrar::DivRegistrar;
 use registrar::{ForDeployed, ForDismissed, SearchActionsRegistrar, WithResults};
 
-const MIN_INPUT_WIDTH_REMS: f32 = 10.;
-const MAX_INPUT_WIDTH_REMS: f32 = 30.;
 const MAX_BUFFER_SEARCH_HISTORY_SIZE: usize = 50;
 
 #[derive(PartialEq, Clone, Deserialize)]
@@ -87,6 +89,7 @@ pub struct BufferSearchBar {
     pending_search: Option<Task<()>>,
     search_options: SearchOptions,
     default_options: SearchOptions,
+    configured_options: SearchOptions,
     query_contains_error: bool,
     dismissed: bool,
     search_history: SearchHistory,
@@ -122,7 +125,7 @@ impl BufferSearchBar {
         };
 
         EditorElement::new(
-            &editor,
+            editor,
             EditorStyle {
                 background: cx.theme().colors().editor_background,
                 local_player: cx.theme().players().local(),
@@ -130,6 +133,10 @@ impl BufferSearchBar {
                 ..Default::default()
             },
         )
+    }
+
+    pub fn query_editor_focused(&self) -> bool {
+        self.query_editor_focused
     }
 }
 
@@ -140,6 +147,8 @@ impl Render for BufferSearchBar {
         if self.dismissed {
             return div().id("search_bar");
         }
+
+        let focus_handle = self.focus_handle(cx);
 
         let narrow_mode =
             self.scroll_handle.bounds().size.width / cx.rem_size() < 340. / BASE_REM_SIZE_IN_PX;
@@ -152,12 +161,12 @@ impl Render for BufferSearchBar {
             query_editor.placeholder_text(cx).is_none()
         }) {
             self.query_editor.update(cx, |editor, cx| {
-                editor.set_placeholder_text("Search", cx);
+                editor.set_placeholder_text("Search…", cx);
             });
         }
 
         self.replacement_editor.update(cx, |editor, cx| {
-            editor.set_placeholder_text("Replace with...", cx);
+            editor.set_placeholder_text("Replace with…", cx);
         });
 
         let mut text_color = Color::Default;
@@ -195,26 +204,33 @@ impl Render for BufferSearchBar {
             cx.theme().colors().border
         };
 
+        let container_width = cx.viewport_size().width;
+        let input_width = SearchInputWidth::calc_width(container_width);
+
+        let input_base_styles = || {
+            h_flex()
+                .min_w_32()
+                .w(input_width)
+                .h_8()
+                .px_2()
+                .py_1()
+                .border_1()
+                .border_color(editor_border)
+                .rounded_lg()
+        };
+
         let search_line = h_flex()
+            .gap_2()
             .child(
-                h_flex()
+                input_base_styles()
                     .id("editor-scroll")
                     .track_scroll(&self.editor_scroll_handle)
-                    .flex_1()
-                    .h_8()
-                    .px_2()
-                    .mr_2()
-                    .py_1()
-                    .border_1()
-                    .border_color(editor_border)
-                    .min_w(rems(MIN_INPUT_WIDTH_REMS))
-                    .max_w(rems(MAX_INPUT_WIDTH_REMS))
-                    .rounded_lg()
                     .child(self.render_text_input(&self.query_editor, text_color.color(cx), cx))
                     .when(!hide_inline_icons, |div| {
                         div.children(supported_options.case.then(|| {
                             self.render_search_option_button(
                                 SearchOptions::CASE_SENSITIVE,
+                                focus_handle.clone(),
                                 cx.listener(|this, _, cx| {
                                     this.toggle_case_sensitive(&ToggleCaseSensitive, cx)
                                 }),
@@ -223,6 +239,7 @@ impl Render for BufferSearchBar {
                         .children(supported_options.word.then(|| {
                             self.render_search_option_button(
                                 SearchOptions::WHOLE_WORD,
+                                focus_handle.clone(),
                                 cx.listener(|this, _, cx| {
                                     this.toggle_whole_word(&ToggleWholeWord, cx)
                                 }),
@@ -231,76 +248,118 @@ impl Render for BufferSearchBar {
                         .children(supported_options.regex.then(|| {
                             self.render_search_option_button(
                                 SearchOptions::REGEX,
+                                focus_handle.clone(),
                                 cx.listener(|this, _, cx| this.toggle_regex(&ToggleRegex, cx)),
                             )
                         }))
                     }),
             )
-            .when(supported_options.replacement, |this| {
-                this.child(
-                    IconButton::new("buffer-search-bar-toggle-replace-button", IconName::Replace)
-                        .style(ButtonStyle::Subtle)
-                        .when(self.replace_enabled, |button| {
-                            button.style(ButtonStyle::Filled)
-                        })
-                        .on_click(cx.listener(|this, _: &ClickEvent, cx| {
-                            this.toggle_replace(&ToggleReplace, cx);
-                        }))
-                        .selected(self.replace_enabled)
-                        .size(ButtonSize::Compact)
-                        .tooltip(|cx| Tooltip::for_action("Toggle replace", &ToggleReplace, cx)),
-                )
-            })
-            .when(supported_options.selection, |this| {
-                this.child(
-                    IconButton::new(
-                        "buffer-search-bar-toggle-search-selection-button",
-                        IconName::SearchSelection,
-                    )
-                    .style(ButtonStyle::Subtle)
-                    .when(self.selection_search_enabled, |button| {
-                        button.style(ButtonStyle::Filled)
-                    })
-                    .on_click(cx.listener(|this, _: &ClickEvent, cx| {
-                        this.toggle_selection(&ToggleSelection, cx);
-                    }))
-                    .selected(self.selection_search_enabled)
-                    .size(ButtonSize::Compact)
-                    .tooltip(|cx| {
-                        Tooltip::for_action("Toggle search selection", &ToggleSelection, cx)
-                    }),
-                )
-            })
             .child(
                 h_flex()
-                    .flex_none()
+                    .gap_1()
+                    .min_w_64()
+                    .when(supported_options.replacement, |this| {
+                        this.child(
+                            IconButton::new(
+                                "buffer-search-bar-toggle-replace-button",
+                                IconName::Replace,
+                            )
+                            .style(ButtonStyle::Subtle)
+                            .shape(IconButtonShape::Square)
+                            .when(self.replace_enabled, |button| {
+                                button.style(ButtonStyle::Filled)
+                            })
+                            .on_click(cx.listener(|this, _: &ClickEvent, cx| {
+                                this.toggle_replace(&ToggleReplace, cx);
+                            }))
+                            .toggle_state(self.replace_enabled)
+                            .tooltip({
+                                let focus_handle = focus_handle.clone();
+                                move |cx| {
+                                    Tooltip::for_action_in(
+                                        "Toggle Replace",
+                                        &ToggleReplace,
+                                        &focus_handle,
+                                        cx,
+                                    )
+                                }
+                            }),
+                        )
+                    })
+                    .when(supported_options.selection, |this| {
+                        this.child(
+                            IconButton::new(
+                                "buffer-search-bar-toggle-search-selection-button",
+                                IconName::SearchSelection,
+                            )
+                            .style(ButtonStyle::Subtle)
+                            .shape(IconButtonShape::Square)
+                            .when(self.selection_search_enabled, |button| {
+                                button.style(ButtonStyle::Filled)
+                            })
+                            .on_click(cx.listener(|this, _: &ClickEvent, cx| {
+                                this.toggle_selection(&ToggleSelection, cx);
+                            }))
+                            .toggle_state(self.selection_search_enabled)
+                            .tooltip({
+                                let focus_handle = focus_handle.clone();
+                                move |cx| {
+                                    Tooltip::for_action_in(
+                                        "Toggle Search Selection",
+                                        &ToggleSelection,
+                                        &focus_handle,
+                                        cx,
+                                    )
+                                }
+                            }),
+                        )
+                    })
                     .child(
                         IconButton::new("select-all", ui::IconName::SelectAll)
                             .on_click(|_, cx| cx.dispatch_action(SelectAllMatches.boxed_clone()))
-                            .size(ButtonSize::Compact)
-                            .tooltip(|cx| {
-                                Tooltip::for_action("Select all matches", &SelectAllMatches, cx)
+                            .shape(IconButtonShape::Square)
+                            .tooltip({
+                                let focus_handle = focus_handle.clone();
+                                move |cx| {
+                                    Tooltip::for_action_in(
+                                        "Select All Matches",
+                                        &SelectAllMatches,
+                                        &focus_handle,
+                                        cx,
+                                    )
+                                }
                             }),
                     )
-                    .child(render_nav_button(
-                        ui::IconName::ChevronLeft,
-                        self.active_match_index.is_some(),
-                        "Select previous match",
-                        &SelectPrevMatch,
-                    ))
-                    .child(render_nav_button(
-                        ui::IconName::ChevronRight,
-                        self.active_match_index.is_some(),
-                        "Select next match",
-                        &SelectNextMatch,
-                    ))
+                    .child(
+                        h_flex()
+                            .pl_2()
+                            .ml_2()
+                            .border_l_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(render_nav_button(
+                                ui::IconName::ChevronLeft,
+                                self.active_match_index.is_some(),
+                                "Select Previous Match",
+                                &SelectPrevMatch,
+                                focus_handle.clone(),
+                            ))
+                            .child(render_nav_button(
+                                ui::IconName::ChevronRight,
+                                self.active_match_index.is_some(),
+                                "Select Next Match",
+                                &SelectNextMatch,
+                                focus_handle.clone(),
+                            )),
+                    )
                     .when(!narrow_mode, |this| {
-                        this.child(h_flex().min_w(rems_from_px(40.)).child(
-                            Label::new(match_text).color(if self.active_match_index.is_some() {
-                                Color::Default
-                            } else {
-                                Color::Disabled
-                            }),
+                        this.child(h_flex().ml_2().min_w(rems_from_px(40.)).child(
+                            Label::new(match_text).size(LabelSize::Small).color(
+                                if self.active_match_index.is_some() {
+                                    Color::Default
+                                } else {
+                                    Color::Disabled
+                                },
+                            ),
                         ))
                     }),
             );
@@ -308,33 +367,28 @@ impl Render for BufferSearchBar {
         let replace_line = should_show_replace_input.then(|| {
             h_flex()
                 .gap_2()
-                .flex_1()
+                .child(input_base_styles().child(self.render_text_input(
+                    &self.replacement_editor,
+                    cx.theme().colors().text,
+                    cx,
+                )))
                 .child(
                     h_flex()
-                        .flex_1()
-                        // We're giving this a fixed height to match the height of the search input,
-                        // which has an icon inside that is increasing its height.
-                        .h_8()
-                        .px_2()
-                        .py_1()
-                        .border_1()
-                        .border_color(cx.theme().colors().border)
-                        .rounded_lg()
-                        .min_w(rems(MIN_INPUT_WIDTH_REMS))
-                        .max_w(rems(MAX_INPUT_WIDTH_REMS))
-                        .child(self.render_text_input(
-                            &self.replacement_editor,
-                            cx.theme().colors().text,
-                            cx,
-                        )),
-                )
-                .child(
-                    h_flex()
-                        .flex_none()
+                        .min_w_64()
+                        .gap_1()
                         .child(
                             IconButton::new("search-replace-next", ui::IconName::ReplaceNext)
-                                .tooltip(move |cx| {
-                                    Tooltip::for_action("Replace next", &ReplaceNext, cx)
+                                .shape(IconButtonShape::Square)
+                                .tooltip({
+                                    let focus_handle = focus_handle.clone();
+                                    move |cx| {
+                                        Tooltip::for_action_in(
+                                            "Replace Next Match",
+                                            &ReplaceNext,
+                                            &focus_handle,
+                                            cx,
+                                        )
+                                    }
                                 })
                                 .on_click(
                                     cx.listener(|this, _, cx| this.replace_next(&ReplaceNext, cx)),
@@ -342,8 +396,17 @@ impl Render for BufferSearchBar {
                         )
                         .child(
                             IconButton::new("search-replace-all", ui::IconName::ReplaceAll)
-                                .tooltip(move |cx| {
-                                    Tooltip::for_action("Replace all", &ReplaceAll, cx)
+                                .shape(IconButtonShape::Square)
+                                .tooltip({
+                                    let focus_handle = focus_handle.clone();
+                                    move |cx| {
+                                        Tooltip::for_action_in(
+                                            "Replace All Matches",
+                                            &ReplaceAll,
+                                            &focus_handle,
+                                            cx,
+                                        )
+                                    }
                                 })
                                 .on_click(
                                     cx.listener(|this, _, cx| this.replace_all(&ReplaceAll, cx)),
@@ -354,6 +417,8 @@ impl Render for BufferSearchBar {
 
         v_flex()
             .id("buffer_search")
+            .gap_2()
+            .py(px(1.0))
             .track_scroll(&self.scroll_handle)
             .key_context(key_context)
             .capture_action(cx.listener(Self::tab))
@@ -382,19 +447,22 @@ impl Render for BufferSearchBar {
             .when(self.supported_options().selection, |this| {
                 this.on_action(cx.listener(Self::toggle_selection))
             })
-            .gap_2()
             .child(
                 h_flex()
+                    .relative()
                     .child(search_line.w_full())
                     .when(!narrow_mode, |div| {
                         div.child(
-                            IconButton::new(SharedString::from("Close"), IconName::Close)
-                                .tooltip(move |cx| {
-                                    Tooltip::for_action("Close search bar", &Dismiss, cx)
-                                })
-                                .on_click(cx.listener(|this, _: &ClickEvent, cx| {
-                                    this.dismiss(&Dismiss, cx)
-                                })),
+                            h_flex().absolute().right_0().child(
+                                IconButton::new(SharedString::from("Close"), IconName::Close)
+                                    .shape(IconButtonShape::Square)
+                                    .tooltip(move |cx| {
+                                        Tooltip::for_action("Close Search Bar", &Dismiss, cx)
+                                    })
+                                    .on_click(cx.listener(|this, _: &ClickEvent, cx| {
+                                        this.dismiss(&Dismiss, cx)
+                                    })),
+                            ),
                         )
                     }),
             )
@@ -438,7 +506,7 @@ impl ToolbarItemView for BufferSearchBar {
                 ));
 
             self.active_searchable_item = Some(searchable_item_handle);
-            drop(self.update_matches(cx));
+            drop(self.update_matches(true, cx));
             if !self.dismissed {
                 return ToolbarItemLocation::Secondary;
             }
@@ -463,6 +531,11 @@ impl BufferSearchBar {
                 this.toggle_whole_word(action, cx);
             }
         }));
+        registrar.register_handler(ForDeployed(|this, action: &ToggleRegex, cx| {
+            if this.supported_options().regex {
+                this.toggle_regex(action, cx);
+            }
+        }));
         registrar.register_handler(ForDeployed(|this, action: &ToggleSelection, cx| {
             if this.supported_options().selection {
                 this.toggle_selection(action, cx);
@@ -485,6 +558,9 @@ impl BufferSearchBar {
         registrar.register_handler(ForDeployed(|this, _: &editor::actions::Cancel, cx| {
             this.dismiss(&Dismiss, cx);
         }));
+        registrar.register_handler(ForDeployed(|this, _: &Dismiss, cx| {
+            this.dismiss(&Dismiss, cx);
+        }));
 
         // register deploy buffer search for both search bar states, since we want to focus into the search bar
         // when the deploy action is triggered in the buffer.
@@ -497,12 +573,14 @@ impl BufferSearchBar {
     }
 
     pub fn new(cx: &mut ViewContext<Self>) -> Self {
-        let query_editor = cx.new_view(|cx| Editor::single_line(cx));
+        let query_editor = cx.new_view(Editor::single_line);
         cx.subscribe(&query_editor, Self::on_query_editor_event)
             .detach();
-        let replacement_editor = cx.new_view(|cx| Editor::single_line(cx));
+        let replacement_editor = cx.new_view(Editor::single_line);
         cx.subscribe(&replacement_editor, Self::on_replacement_editor_event)
             .detach();
+
+        let search_options = SearchOptions::from_settings(&EditorSettings::get_global(cx).search);
 
         Self {
             query_editor,
@@ -513,8 +591,9 @@ impl BufferSearchBar {
             active_searchable_item_subscription: None,
             active_match_index: None,
             searchable_items_with_matches: Default::default(),
-            default_options: SearchOptions::NONE,
-            search_options: SearchOptions::NONE,
+            default_options: search_options,
+            configured_options: search_options,
+            search_options,
             pending_search: None,
             query_contains_error: false,
             dismissed: true,
@@ -551,7 +630,7 @@ impl BufferSearchBar {
             active_editor.search_bar_visibility_changed(false, cx);
             active_editor.toggle_filtered_search_ranges(false, cx);
             let handle = active_editor.focus_handle(cx);
-            cx.focus(&handle);
+            self.focus(&handle, cx);
         }
         cx.emit(Event::UpdateLocation);
         cx.emit(ToolbarItemEvent::ChangeLocation(
@@ -566,6 +645,7 @@ impl BufferSearchBar {
                 active_item.toggle_filtered_search_ranges(deploy.selection_search_enabled, cx);
             }
             self.search_suggested(cx);
+            self.smartcase(cx);
             self.replace_enabled = deploy.replace_enabled;
             self.selection_search_enabled = deploy.selection_search_enabled;
             if deploy.focus {
@@ -585,6 +665,7 @@ impl BufferSearchBar {
             return true;
         }
 
+        cx.propagate();
         false
     }
 
@@ -600,6 +681,13 @@ impl BufferSearchBar {
         let Some(handle) = self.active_searchable_item.as_ref() else {
             return false;
         };
+
+        self.configured_options =
+            SearchOptions::from_settings(&EditorSettings::get_global(cx).search);
+        if self.dismissed && self.configured_options != self.default_options {
+            self.search_options = self.configured_options;
+            self.default_options = self.configured_options;
+        }
 
         self.dismissed = false;
         handle.search_bar_visibility_changed(true, cx);
@@ -617,6 +705,7 @@ impl BufferSearchBar {
             .map(SearchableItemHandle::supported_options)
             .unwrap_or_default()
     }
+
     pub fn search_suggested(&mut self, cx: &mut ViewContext<Self>) {
         let search = self
             .query_suggestion(cx)
@@ -687,7 +776,8 @@ impl BufferSearchBar {
         cx: &mut ViewContext<Self>,
     ) -> oneshot::Receiver<()> {
         let options = options.unwrap_or(self.default_options);
-        if query != self.query(cx) || self.search_options != options {
+        let updated = query != self.query(cx) || self.search_options != options;
+        if updated {
             self.query_editor.update(cx, |query_editor, cx| {
                 query_editor.buffer().update(cx, |query_buffer, cx| {
                     let len = query_buffer.len(cx);
@@ -698,16 +788,17 @@ impl BufferSearchBar {
             self.clear_matches(cx);
             cx.notify();
         }
-        self.update_matches(cx)
+        self.update_matches(!updated, cx)
     }
 
     fn render_search_option_button(
         &self,
         option: SearchOptions,
+        focus_handle: FocusHandle,
         action: impl Fn(&ClickEvent, &mut WindowContext) + 'static,
     ) -> impl IntoElement {
         let is_active = self.search_options.contains(option);
-        option.as_button(is_active, action)
+        option.as_button(is_active, focus_handle, action)
     }
 
     pub fn focus_editor(&mut self, _: &FocusEditor, cx: &mut ViewContext<Self>) {
@@ -717,11 +808,19 @@ impl BufferSearchBar {
         }
     }
 
-    fn toggle_search_option(&mut self, search_option: SearchOptions, cx: &mut ViewContext<Self>) {
+    pub fn toggle_search_option(
+        &mut self,
+        search_option: SearchOptions,
+        cx: &mut ViewContext<Self>,
+    ) {
         self.search_options.toggle(search_option);
         self.default_options = self.search_options;
-        drop(self.update_matches(cx));
+        drop(self.update_matches(false, cx));
         cx.notify();
+    }
+
+    pub fn has_search_option(&mut self, search_option: SearchOptions) -> bool {
+        self.search_options.contains(search_option)
     }
 
     pub fn enable_search_option(
@@ -774,13 +873,12 @@ impl BufferSearchBar {
                     .filter(|matches| !matches.is_empty())
                 {
                     // If 'wrapscan' is disabled, searches do not wrap around the end of the file.
-                    if !EditorSettings::get_global(cx).search_wrap {
-                        if (direction == Direction::Next && index + count >= matches.len())
-                            || (direction == Direction::Prev && index < count)
-                        {
-                            crate::show_no_more_matches(cx);
-                            return;
-                        }
+                    if !EditorSettings::get_global(cx).search_wrap
+                        && ((direction == Direction::Next && index + count >= matches.len())
+                            || (direction == Direction::Prev && index < count))
+                    {
+                        crate::show_no_more_matches(cx);
+                        return;
                     }
                     let new_match_index = searchable_item
                         .match_index_for_direction(matches, index, direction, count, cx);
@@ -798,7 +896,7 @@ impl BufferSearchBar {
                 .searchable_items_with_matches
                 .get(&searchable_item.downgrade())
             {
-                if matches.len() == 0 {
+                if matches.is_empty() {
                     return;
                 }
                 let new_match_index = matches.len() - 1;
@@ -818,8 +916,9 @@ impl BufferSearchBar {
             editor::EditorEvent::Focused => self.query_editor_focused = true,
             editor::EditorEvent::Blurred => self.query_editor_focused = false,
             editor::EditorEvent::Edited { .. } => {
+                self.smartcase(cx);
                 self.clear_matches(cx);
-                let search = self.update_matches(cx);
+                let search = self.update_matches(false, cx);
 
                 let width = editor.update(cx, |editor, cx| {
                     let text_layout_details = editor.text_layout_details(cx);
@@ -857,7 +956,7 @@ impl BufferSearchBar {
     fn on_active_searchable_item_event(&mut self, event: &SearchEvent, cx: &mut ViewContext<Self>) {
         match event {
             SearchEvent::MatchesInvalidated => {
-                drop(self.update_matches(cx));
+                drop(self.update_matches(false, cx));
             }
             SearchEvent::ActiveMatchChanged => self.update_match_index(cx),
         }
@@ -875,7 +974,7 @@ impl BufferSearchBar {
         if let Some(active_item) = self.active_searchable_item.as_mut() {
             self.selection_search_enabled = !self.selection_search_enabled;
             active_item.toggle_filtered_search_ranges(self.selection_search_enabled, cx);
-            drop(self.update_matches(cx));
+            drop(self.update_matches(false, cx));
             cx.notify();
         }
     }
@@ -915,7 +1014,11 @@ impl BufferSearchBar {
             .extend(active_item_matches);
     }
 
-    fn update_matches(&mut self, cx: &mut ViewContext<Self>) -> oneshot::Receiver<()> {
+    fn update_matches(
+        &mut self,
+        reuse_existing_query: bool,
+        cx: &mut ViewContext<Self>,
+    ) -> oneshot::Receiver<()> {
         let (done_tx, done_rx) = oneshot::channel();
         let query = self.query(cx);
         self.pending_search.take();
@@ -927,42 +1030,51 @@ impl BufferSearchBar {
                 let _ = done_tx.send(());
                 cx.notify();
             } else {
-                let query: Arc<_> = if self.search_options.contains(SearchOptions::REGEX) {
-                    match SearchQuery::regex(
-                        query,
-                        self.search_options.contains(SearchOptions::WHOLE_WORD),
-                        self.search_options.contains(SearchOptions::CASE_SENSITIVE),
-                        false,
-                        Default::default(),
-                        Default::default(),
-                    ) {
-                        Ok(query) => query.with_replacement(self.replacement(cx)),
-                        Err(_) => {
-                            self.query_contains_error = true;
-                            self.clear_active_searchable_item_matches(cx);
-                            cx.notify();
-                            return done_rx;
-                        }
-                    }
+                let query: Arc<_> = if let Some(search) =
+                    self.active_search.take().filter(|_| reuse_existing_query)
+                {
+                    search
                 } else {
-                    match SearchQuery::text(
-                        query,
-                        self.search_options.contains(SearchOptions::WHOLE_WORD),
-                        self.search_options.contains(SearchOptions::CASE_SENSITIVE),
-                        false,
-                        Default::default(),
-                        Default::default(),
-                    ) {
-                        Ok(query) => query.with_replacement(self.replacement(cx)),
-                        Err(_) => {
-                            self.query_contains_error = true;
-                            self.clear_active_searchable_item_matches(cx);
-                            cx.notify();
-                            return done_rx;
+                    if self.search_options.contains(SearchOptions::REGEX) {
+                        match SearchQuery::regex(
+                            query,
+                            self.search_options.contains(SearchOptions::WHOLE_WORD),
+                            self.search_options.contains(SearchOptions::CASE_SENSITIVE),
+                            false,
+                            Default::default(),
+                            Default::default(),
+                            None,
+                        ) {
+                            Ok(query) => query.with_replacement(self.replacement(cx)),
+                            Err(_) => {
+                                self.query_contains_error = true;
+                                self.clear_active_searchable_item_matches(cx);
+                                cx.notify();
+                                return done_rx;
+                            }
+                        }
+                    } else {
+                        match SearchQuery::text(
+                            query,
+                            self.search_options.contains(SearchOptions::WHOLE_WORD),
+                            self.search_options.contains(SearchOptions::CASE_SENSITIVE),
+                            false,
+                            Default::default(),
+                            Default::default(),
+                            None,
+                        ) {
+                            Ok(query) => query.with_replacement(self.replacement(cx)),
+                            Err(_) => {
+                                self.query_contains_error = true;
+                                self.clear_active_searchable_item_matches(cx);
+                                cx.notify();
+                                return done_rx;
+                            }
                         }
                     }
-                }
-                .into();
+                    .into()
+                };
+
                 self.active_search = Some(query.clone());
                 let query_text = query.as_str().to_string();
 
@@ -987,7 +1099,11 @@ impl BufferSearchBar {
                                     .searchable_items_with_matches
                                     .get(&active_searchable_item.downgrade())
                                     .unwrap();
-                                active_searchable_item.update_matches(matches, cx);
+                                if matches.is_empty() {
+                                    active_searchable_item.clear_matches(cx);
+                                } else {
+                                    active_searchable_item.update_matches(matches, cx);
+                                }
                                 let _ = done_tx.send(());
                             }
                             cx.notify();
@@ -1025,7 +1141,7 @@ impl BufferSearchBar {
         } else {
             return;
         };
-        cx.focus(&focus_handle);
+        self.focus(&focus_handle, cx);
         cx.stop_propagation();
     }
 
@@ -1038,7 +1154,7 @@ impl BufferSearchBar {
         } else {
             return;
         };
-        cx.focus(&focus_handle);
+        self.focus(&focus_handle, cx);
         cx.stop_propagation();
     }
 
@@ -1076,18 +1192,26 @@ impl BufferSearchBar {
         }
     }
 
+    fn focus(&self, handle: &gpui::FocusHandle, cx: &mut ViewContext<Self>) {
+        cx.on_next_frame(|_, cx| {
+            cx.invalidate_character_coordinates();
+        });
+        cx.focus(handle);
+    }
+
     fn toggle_replace(&mut self, _: &ToggleReplace, cx: &mut ViewContext<Self>) {
-        if let Some(_) = &self.active_searchable_item {
+        if self.active_searchable_item.is_some() {
             self.replace_enabled = !self.replace_enabled;
             let handle = if self.replace_enabled {
                 self.replacement_editor.focus_handle(cx)
             } else {
                 self.query_editor.focus_handle(cx)
             };
-            cx.focus(&handle);
+            self.focus(&handle, cx);
             cx.notify();
         }
     }
+
     fn replace_next(&mut self, _: &ReplaceNext, cx: &mut ViewContext<Self>) {
         let mut should_propagate = true;
         if !self.dismissed && self.active_search.is_some() {
@@ -1115,6 +1239,7 @@ impl BufferSearchBar {
             cx.stop_propagation();
         }
     }
+
     pub fn replace_all(&mut self, _: &ReplaceAll, cx: &mut ViewContext<Self>) {
         if !self.dismissed && self.active_search.is_some() {
             if let Some(searchable_item) = self.active_searchable_item.as_ref() {
@@ -1138,6 +1263,26 @@ impl BufferSearchBar {
         self.update_match_index(cx);
         self.active_match_index.is_some()
     }
+
+    pub fn should_use_smartcase_search(&mut self, cx: &mut ViewContext<Self>) -> bool {
+        EditorSettings::get_global(cx).use_smartcase_search
+    }
+
+    pub fn is_contains_uppercase(&mut self, str: &String) -> bool {
+        str.chars().any(|c| c.is_uppercase())
+    }
+
+    fn smartcase(&mut self, cx: &mut ViewContext<Self>) {
+        if self.should_use_smartcase_search(cx) {
+            let query = self.query(cx);
+            if !query.is_empty() {
+                let is_case = self.is_contains_uppercase(&query);
+                if self.has_search_option(SearchOptions::CASE_SENSITIVE) != is_case {
+                    self.toggle_search_option(SearchOptions::CASE_SENSITIVE, cx);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1145,10 +1290,11 @@ mod tests {
     use std::ops::Range;
 
     use super::*;
-    use editor::{display_map::DisplayRow, DisplayPoint, Editor, MultiBuffer};
-    use gpui::{Context, Hsla, TestAppContext, VisualTestContext};
+    use editor::{display_map::DisplayRow, DisplayPoint, Editor, MultiBuffer, SearchSettings};
+    use gpui::{Context, Hsla, TestAppContext, UpdateGlobal, VisualTestContext};
     use language::{Buffer, Point};
     use project::Project;
+    use settings::SettingsStore;
     use smol::stream::StreamExt as _;
     use unindent::Unindent as _;
 
@@ -1161,6 +1307,7 @@ mod tests {
             language::init(cx);
             Project::init_settings(cx);
             theme::init(theme::LoadThemes::JustBase, cx);
+            crate::init(cx);
         });
     }
 
@@ -1665,7 +1812,7 @@ mod tests {
         let last_match_selections = window
             .update(cx, |_, cx| {
                 assert!(
-                    editor.read(cx).is_focused(&cx),
+                    editor.read(cx).is_focused(cx),
                     "Should still have editor focused after SelectPrevMatch"
                 );
 
@@ -1725,6 +1872,86 @@ mod tests {
                 });
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_search_query_with_match_whole_word(cx: &mut TestAppContext) {
+        init_globals(cx);
+        let buffer_text = r#"
+        self.buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                edits,
+                Some(AutoindentMode::Block {
+                    original_indent_columns,
+                }),
+                cx,
+            )
+        });
+
+        this.buffer.update(cx, |buffer, cx| {
+            buffer.edit([(end_of_line..start_of_next_line, replace)], None, cx)
+        });
+        "#
+        .unindent();
+        let buffer = cx.new_model(|cx| Buffer::local(buffer_text, cx));
+        let cx = cx.add_empty_window();
+
+        let editor = cx.new_view(|cx| Editor::for_buffer(buffer.clone(), None, cx));
+
+        let search_bar = cx.new_view(|cx| {
+            let mut search_bar = BufferSearchBar::new(cx);
+            search_bar.set_active_pane_item(Some(&editor), cx);
+            search_bar.show(cx);
+            search_bar
+        });
+
+        search_bar
+            .update(cx, |search_bar, cx| {
+                search_bar.search(
+                    "edit\\(",
+                    Some(SearchOptions::WHOLE_WORD | SearchOptions::REGEX),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        search_bar.update(cx, |search_bar, cx| {
+            search_bar.select_all_matches(&SelectAllMatches, cx);
+        });
+        search_bar.update(cx, |_, cx| {
+            let all_selections =
+                editor.update(cx, |editor, cx| editor.selections.display_ranges(cx));
+            assert_eq!(
+                all_selections.len(),
+                2,
+                "Should select all `edit(` in the buffer, but got: {all_selections:?}"
+            );
+        });
+
+        search_bar
+            .update(cx, |search_bar, cx| {
+                search_bar.search(
+                    "edit(",
+                    Some(SearchOptions::WHOLE_WORD | SearchOptions::CASE_SENSITIVE),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        search_bar.update(cx, |search_bar, cx| {
+            search_bar.select_all_matches(&SelectAllMatches, cx);
+        });
+        search_bar.update(cx, |_, cx| {
+            let all_selections =
+                editor.update(cx, |editor, cx| editor.selections.display_ranges(cx));
+            assert_eq!(
+                all_selections.len(),
+                2,
+                "Should select all `edit(` in the buffer, but got: {all_selections:?}"
+            );
+        });
     }
 
     #[gpui::test]
@@ -2267,6 +2494,121 @@ mod tests {
             .unwrap_err();
         editor.update(cx, |editor, cx| {
             assert!(display_points_of(editor.all_text_background_highlights(cx)).is_empty(),);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_search_options_changes(cx: &mut TestAppContext) {
+        let (_editor, search_bar, cx) = init_test(cx);
+        update_search_settings(
+            SearchSettings {
+                whole_word: false,
+                case_sensitive: false,
+                include_ignored: false,
+                regex: false,
+            },
+            cx,
+        );
+
+        let deploy = Deploy {
+            focus: true,
+            replace_enabled: false,
+            selection_search_enabled: true,
+        };
+
+        search_bar.update(cx, |search_bar, cx| {
+            assert_eq!(
+                search_bar.search_options,
+                SearchOptions::NONE,
+                "Should have no search options enabled by default"
+            );
+            search_bar.toggle_search_option(SearchOptions::WHOLE_WORD, cx);
+            assert_eq!(
+                search_bar.search_options,
+                SearchOptions::WHOLE_WORD,
+                "Should enable the option toggled"
+            );
+            assert!(
+                !search_bar.dismissed,
+                "Search bar should be present and visible"
+            );
+            search_bar.deploy(&deploy, cx);
+            assert_eq!(
+                search_bar.configured_options,
+                SearchOptions::NONE,
+                "Should have configured search options matching the settings"
+            );
+            assert_eq!(
+                search_bar.search_options,
+                SearchOptions::WHOLE_WORD,
+                "After (re)deploying, the option should still be enabled"
+            );
+
+            search_bar.dismiss(&Dismiss, cx);
+            search_bar.deploy(&deploy, cx);
+            assert_eq!(
+                search_bar.search_options,
+                SearchOptions::NONE,
+                "After hiding and showing the search bar, default options should be used"
+            );
+
+            search_bar.toggle_search_option(SearchOptions::REGEX, cx);
+            search_bar.toggle_search_option(SearchOptions::WHOLE_WORD, cx);
+            assert_eq!(
+                search_bar.search_options,
+                SearchOptions::REGEX | SearchOptions::WHOLE_WORD,
+                "Should enable the options toggled"
+            );
+            assert!(
+                !search_bar.dismissed,
+                "Search bar should be present and visible"
+            );
+        });
+
+        update_search_settings(
+            SearchSettings {
+                whole_word: false,
+                case_sensitive: true,
+                include_ignored: false,
+                regex: false,
+            },
+            cx,
+        );
+        search_bar.update(cx, |search_bar, cx| {
+            assert_eq!(
+                search_bar.search_options,
+                SearchOptions::REGEX | SearchOptions::WHOLE_WORD,
+                "Should have no search options enabled by default"
+            );
+
+            search_bar.deploy(&deploy, cx);
+            assert_eq!(
+                search_bar.configured_options,
+                SearchOptions::CASE_SENSITIVE,
+                "Should have configured search options matching the settings"
+            );
+            assert_eq!(
+                search_bar.search_options,
+                SearchOptions::REGEX | SearchOptions::WHOLE_WORD,
+                "Toggling a non-dismissed search bar with custom options should not change the default options"
+            );
+            search_bar.dismiss(&Dismiss, cx);
+            search_bar.deploy(&deploy, cx);
+            assert_eq!(
+                search_bar.search_options,
+                SearchOptions::CASE_SENSITIVE,
+                "After hiding and showing the search bar, default options should be used"
+            );
+        });
+    }
+
+    fn update_search_settings(search_settings: SearchSettings, cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings::<EditorSettings>(cx, |settings| {
+                    settings.search = Some(search_settings);
+                });
+            });
         });
     }
 }

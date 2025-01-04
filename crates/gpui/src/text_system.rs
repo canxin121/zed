@@ -17,7 +17,7 @@ use crate::{
     StrikethroughStyle, UnderlineStyle,
 };
 use anyhow::anyhow;
-use collections::{BTreeSet, FxHashMap};
+use collections::FxHashMap;
 use core::fmt;
 use derive_more::Deref;
 use itertools::Itertools;
@@ -78,18 +78,16 @@ impl TextSystem {
 
     /// Get a list of all available font names from the operating system.
     pub fn all_font_names(&self) -> Vec<String> {
-        let mut names: BTreeSet<_> = self
-            .platform_text_system
-            .all_font_names()
-            .into_iter()
-            .collect();
-        names.extend(self.platform_text_system.all_font_families());
+        let mut names = self.platform_text_system.all_font_names();
         names.extend(
             self.fallback_font_stack
                 .iter()
                 .map(|font| font.family.to_string()),
         );
-        names.into_iter().collect()
+        names.push(".SystemUIFont".to_string());
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Add a font's data to the text system.
@@ -358,7 +356,7 @@ impl WindowTextSystem {
             });
         }
 
-        let layout = self.layout_line(text.as_ref(), font_size, runs)?;
+        let layout = self.layout_line(&text, font_size, runs)?;
 
         Ok(ShapedLine {
             layout,
@@ -485,12 +483,16 @@ impl WindowTextSystem {
     /// Subsets of the line can be styled independently with the `runs` parameter.
     /// Generally, you should prefer to use `TextLayout::shape_line` instead, which
     /// can be painted directly.
-    pub fn layout_line(
+    pub fn layout_line<Text>(
         &self,
-        text: &str,
+        text: Text,
         font_size: Pixels,
         runs: &[TextRun],
-    ) -> Result<Arc<LineLayout>> {
+    ) -> Result<Arc<LineLayout>>
+    where
+        Text: AsRef<str>,
+        SharedString: From<Text>,
+    {
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
         for run in runs.iter() {
             let font_id = self.resolve_font(&run.font);
@@ -670,6 +672,7 @@ impl Hash for RenderGlyphParams {
         self.font_size.0.to_bits().hash(state);
         self.subpixel_variant.hash(state);
         self.scale_factor.to_bits().hash(state);
+        self.is_emoji.hash(state);
     }
 }
 

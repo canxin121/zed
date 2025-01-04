@@ -2,8 +2,8 @@ use smallvec::SmallVec;
 use taffy::style::{Display, Position};
 
 use crate::{
-    point, AnyElement, Bounds, Element, GlobalElementId, IntoElement, LayoutId, ParentElement,
-    Pixels, Point, Size, Style, WindowContext,
+    point, AnyElement, Axis, Bounds, Corner, Edges, Element, GlobalElementId, IntoElement,
+    LayoutId, ParentElement, Pixels, Point, Size, Style, WindowContext,
 };
 
 /// The state that the anchored element element uses to track its children.
@@ -15,7 +15,7 @@ pub struct AnchoredState {
 /// will avoid overflowing the window bounds.
 pub struct Anchored {
     children: SmallVec<[AnyElement; 2]>,
-    anchor_corner: AnchorCorner,
+    anchor_corner: Corner,
     fit_mode: AnchoredFitMode,
     anchor_position: Option<Point<Pixels>>,
     position_mode: AnchoredPositionMode,
@@ -26,7 +26,7 @@ pub struct Anchored {
 pub fn anchored() -> Anchored {
     Anchored {
         children: SmallVec::new(),
-        anchor_corner: AnchorCorner::TopLeft,
+        anchor_corner: Corner::TopLeft,
         fit_mode: AnchoredFitMode::SwitchAnchor,
         anchor_position: None,
         position_mode: AnchoredPositionMode::Window,
@@ -35,7 +35,7 @@ pub fn anchored() -> Anchored {
 
 impl Anchored {
     /// Sets which corner of the anchored element should be anchored to the current position.
-    pub fn anchor(mut self, anchor: AnchorCorner) -> Self {
+    pub fn anchor(mut self, anchor: Corner) -> Self {
         self.anchor_corner = anchor;
         self
     }
@@ -58,6 +58,12 @@ impl Anchored {
     /// Snap to window edge instead of switching anchor corner when an overflow would occur.
     pub fn snap_to_window(mut self) -> Self {
         self.fit_mode = AnchoredFitMode::SnapToWindow;
+        self
+    }
+
+    /// Snap to window edge and leave some margins.
+    pub fn snap_to_window_with_margin(mut self, edges: impl Into<Edges<Pixels>>) -> Self {
+        self.fit_mode = AnchoredFitMode::SnapToWindowWithMargin(edges.into());
         self
     }
 }
@@ -114,7 +120,7 @@ impl Element for Anchored {
         for child_layout_id in &request_layout.child_layout_ids {
             let child_bounds = cx.layout_bounds(*child_layout_id);
             child_min = child_min.min(&child_bounds.origin);
-            child_max = child_max.max(&child_bounds.lower_right());
+            child_max = child_max.max(&child_bounds.bottom_right());
         }
         let size: Size<Pixels> = (child_max - child_min).into();
 
@@ -134,41 +140,50 @@ impl Element for Anchored {
             let mut anchor_corner = self.anchor_corner;
 
             if desired.left() < limits.left() || desired.right() > limits.right() {
-                let switched = anchor_corner
-                    .switch_axis(Axis::Horizontal)
-                    .get_bounds(origin, size);
+                let switched = Bounds::from_corner_and_size(
+                    anchor_corner.other_side_corner_along(Axis::Horizontal),
+                    origin,
+                    size,
+                );
                 if !(switched.left() < limits.left() || switched.right() > limits.right()) {
-                    anchor_corner = anchor_corner.switch_axis(Axis::Horizontal);
+                    anchor_corner = anchor_corner.other_side_corner_along(Axis::Horizontal);
                     desired = switched
                 }
             }
 
             if desired.top() < limits.top() || desired.bottom() > limits.bottom() {
-                let switched = anchor_corner
-                    .switch_axis(Axis::Vertical)
-                    .get_bounds(origin, size);
+                let switched = Bounds::from_corner_and_size(
+                    anchor_corner.other_side_corner_along(Axis::Vertical),
+                    origin,
+                    size,
+                );
                 if !(switched.top() < limits.top() || switched.bottom() > limits.bottom()) {
                     desired = switched;
                 }
             }
         }
 
+        let edges = match self.fit_mode {
+            AnchoredFitMode::SnapToWindowWithMargin(edges) => edges,
+            _ => Edges::default(),
+        };
+
         // Snap the horizontal edges of the anchored element to the horizontal edges of the window if
         // its horizontal bounds overflow, aligning to the left if it is wider than the limits.
         if desired.right() > limits.right() {
-            desired.origin.x -= desired.right() - limits.right();
+            desired.origin.x -= desired.right() - limits.right() + edges.right;
         }
         if desired.left() < limits.left() {
-            desired.origin.x = limits.origin.x;
+            desired.origin.x = limits.origin.x + edges.left;
         }
 
         // Snap the vertical edges of the anchored element to the vertical edges of the window if
         // its vertical bounds overflow, aligning to the top if it is taller than the limits.
         if desired.bottom() > limits.bottom() {
-            desired.origin.y -= desired.bottom() - limits.bottom();
+            desired.origin.y -= desired.bottom() - limits.bottom() + edges.bottom;
         }
         if desired.top() < limits.top() {
-            desired.origin.y = limits.origin.y;
+            desired.origin.y = limits.origin.y + edges.top;
         }
 
         let offset = desired.origin - bounds.origin;
@@ -203,26 +218,23 @@ impl IntoElement for Anchored {
     }
 }
 
-enum Axis {
-    Horizontal,
-    Vertical,
-}
-
 /// Which algorithm to use when fitting the anchored element to be inside the window.
 #[derive(Copy, Clone, PartialEq)]
 pub enum AnchoredFitMode {
-    /// Snap the anchored element to the window edge
+    /// Snap the anchored element to the window edge.
     SnapToWindow,
-    /// Switch which corner anchor this anchored element is attached to
+    /// Snap to window edge and leave some margins.
+    SnapToWindowWithMargin(Edges<Pixels>),
+    /// Switch which corner anchor this anchored element is attached to.
     SwitchAnchor,
 }
 
 /// Which algorithm to use when positioning the anchored element.
 #[derive(Copy, Clone, PartialEq)]
 pub enum AnchoredPositionMode {
-    /// Position the anchored element relative to the window
+    /// Position the anchored element relative to the window.
     Window,
-    /// Position the anchored element relative to its parent
+    /// Position the anchored element relative to its parent.
     Local,
 }
 
@@ -230,83 +242,25 @@ impl AnchoredPositionMode {
     fn get_position_and_bounds(
         &self,
         anchor_position: Option<Point<Pixels>>,
-        anchor_corner: AnchorCorner,
+        anchor_corner: Corner,
         size: Size<Pixels>,
         bounds: Bounds<Pixels>,
     ) -> (Point<Pixels>, Bounds<Pixels>) {
         match self {
             AnchoredPositionMode::Window => {
                 let anchor_position = anchor_position.unwrap_or(bounds.origin);
-                let bounds = anchor_corner.get_bounds(anchor_position, size);
+                let bounds = Bounds::from_corner_and_size(anchor_corner, anchor_position, size);
                 (anchor_position, bounds)
             }
             AnchoredPositionMode::Local => {
                 let anchor_position = anchor_position.unwrap_or_default();
-                let bounds = anchor_corner.get_bounds(bounds.origin + anchor_position, size);
+                let bounds = Bounds::from_corner_and_size(
+                    anchor_corner,
+                    bounds.origin + anchor_position,
+                    size,
+                );
                 (anchor_position, bounds)
             }
-        }
-    }
-}
-
-/// Which corner of the anchored element should be considered the anchor.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum AnchorCorner {
-    /// The top left corner
-    TopLeft,
-    /// The top right corner
-    TopRight,
-    /// The bottom left corner
-    BottomLeft,
-    /// The bottom right corner
-    BottomRight,
-}
-
-impl AnchorCorner {
-    fn get_bounds(&self, origin: Point<Pixels>, size: Size<Pixels>) -> Bounds<Pixels> {
-        let origin = match self {
-            Self::TopLeft => origin,
-            Self::TopRight => Point {
-                x: origin.x - size.width,
-                y: origin.y,
-            },
-            Self::BottomLeft => Point {
-                x: origin.x,
-                y: origin.y - size.height,
-            },
-            Self::BottomRight => Point {
-                x: origin.x - size.width,
-                y: origin.y - size.height,
-            },
-        };
-
-        Bounds { origin, size }
-    }
-
-    /// Get the point corresponding to this anchor corner in `bounds`.
-    pub fn corner(&self, bounds: Bounds<Pixels>) -> Point<Pixels> {
-        match self {
-            Self::TopLeft => bounds.origin,
-            Self::TopRight => bounds.upper_right(),
-            Self::BottomLeft => bounds.lower_left(),
-            Self::BottomRight => bounds.lower_right(),
-        }
-    }
-
-    fn switch_axis(self, axis: Axis) -> Self {
-        match axis {
-            Axis::Vertical => match self {
-                AnchorCorner::TopLeft => AnchorCorner::BottomLeft,
-                AnchorCorner::TopRight => AnchorCorner::BottomRight,
-                AnchorCorner::BottomLeft => AnchorCorner::TopLeft,
-                AnchorCorner::BottomRight => AnchorCorner::TopRight,
-            },
-            Axis::Horizontal => match self {
-                AnchorCorner::TopLeft => AnchorCorner::TopRight,
-                AnchorCorner::TopRight => AnchorCorner::TopLeft,
-                AnchorCorner::BottomLeft => AnchorCorner::BottomRight,
-                AnchorCorner::BottomRight => AnchorCorner::BottomLeft,
-            },
         }
     }
 }

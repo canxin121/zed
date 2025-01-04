@@ -1,7 +1,6 @@
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::{cell::RefCell, sync::LazyLock};
 
 use anyhow::Result;
 use markup5ever_rcdom::{Handle, NodeData};
@@ -10,13 +9,14 @@ use regex::Regex;
 use crate::html_element::HtmlElement;
 
 fn empty_line_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r"^\s*$").unwrap())
+    static REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\s*$").expect("Failed to create empty_line_regex"));
+    &REGEX
 }
 
 fn more_than_three_newlines_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r"\n{3,}").unwrap())
+    static REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
+    &REGEX
 }
 
 pub enum StartTagOutcome {
@@ -29,6 +29,12 @@ pub type TagHandler = Rc<RefCell<dyn HandleTag>>;
 pub struct MarkdownWriter {
     current_element_stack: VecDeque<HtmlElement>,
     pub(crate) markdown: String,
+}
+
+impl Default for MarkdownWriter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MarkdownWriter {
@@ -64,8 +70,8 @@ impl MarkdownWriter {
         self.push_str("\n\n");
     }
 
-    pub fn run(mut self, root_node: &Handle, handlers: &mut Vec<TagHandler>) -> Result<String> {
-        self.visit_node(&root_node, handlers)?;
+    pub fn run(mut self, root_node: &Handle, handlers: &mut [TagHandler]) -> Result<String> {
+        self.visit_node(root_node, handlers)?;
         Ok(Self::prettify_markdown(self.markdown))
     }
 
@@ -104,7 +110,7 @@ impl MarkdownWriter {
         }
 
         if let Some(current_element) = current_element.as_ref() {
-            match self.start_tag(&current_element, handlers) {
+            match self.start_tag(current_element, handlers) {
                 StartTagOutcome::Continue => {}
                 StartTagOutcome::Skip => return Ok(()),
             }

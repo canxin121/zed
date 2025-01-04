@@ -2,13 +2,11 @@
   // Standard Linux bindings
   {
     "bindings": {
-      "up": "menu::SelectPrev",
       "shift-tab": "menu::SelectPrev",
       "home": "menu::SelectFirst",
       "pageup": "menu::SelectFirst",
       "shift-pageup": "menu::SelectFirst",
       "ctrl-p": "menu::SelectPrev",
-      "down": "menu::SelectNext",
       "tab": "menu::SelectNext",
       "end": "menu::SelectLast",
       "pagedown": "menu::SelectLast",
@@ -19,6 +17,7 @@
       "escape": "menu::Cancel",
       "ctrl-escape": "menu::Cancel",
       "ctrl-c": "menu::Cancel",
+      "alt-shift-enter": "menu::Restart",
       "alt-enter": ["picker::ConfirmInput", { "secondary": false }],
       "ctrl-alt-enter": ["picker::ConfirmInput", { "secondary": true }],
       "ctrl-shift-w": "workspace::CloseWindow",
@@ -34,6 +33,20 @@
     }
   },
   {
+    "context": "Picker || menu",
+    "bindings": {
+      "up": "menu::SelectPrev",
+      "down": "menu::SelectNext"
+    }
+  },
+  {
+    "context": "Prompt",
+    "bindings": {
+      "left": "menu::SelectPrev",
+      "right": "menu::SelectNext"
+    }
+  },
+  {
     "context": "Editor",
     "bindings": {
       "escape": "editor::Cancel",
@@ -44,14 +57,13 @@
       "shift-tab": "editor::TabPrev",
       "ctrl-k": "editor::CutToEndOfLine",
       // "ctrl-t": "editor::Transpose",
+      "ctrl-k ctrl-q": "editor::Rewrap",
+      "ctrl-k q": "editor::Rewrap",
       "ctrl-backspace": "editor::DeleteToPreviousWordStart",
       "ctrl-delete": "editor::DeleteToNextWordEnd",
       "shift-delete": "editor::Cut",
-      "ctrl-x": "editor::Cut",
       "ctrl-insert": "editor::Copy",
-      "ctrl-c": "editor::Copy",
       "shift-insert": "editor::Paste",
-      "ctrl-v": "editor::Paste",
       "ctrl-y": "editor::Redo",
       "ctrl-z": "editor::Undo",
       "ctrl-shift-z": "editor::Redo",
@@ -97,7 +109,18 @@
       "ctrl-'": "editor::ToggleHunkDiff",
       "ctrl-\"": "editor::ExpandAllHunkDiffs",
       "ctrl-i": "editor::ShowSignatureHelp",
-      "alt-g b": "editor::ToggleGitBlame"
+      "alt-g b": "editor::ToggleGitBlame",
+      "menu": "editor::OpenContextMenu",
+      "shift-f10": "editor::OpenContextMenu"
+    }
+  },
+  {
+    // Separate block with same context so these display in context menus
+    "context": "Editor",
+    "bindings": {
+      "ctrl-x": "editor::Cut",
+      "ctrl-c": "editor::Copy",
+      "ctrl-v": "editor::Paste"
     }
   },
   {
@@ -107,7 +130,8 @@
       "shift-enter": "editor::Newline",
       "ctrl-enter": "editor::NewlineAbove",
       "ctrl-shift-enter": "editor::NewlineBelow",
-      "alt-z": "editor::ToggleSoftWrap",
+      "ctrl-k ctrl-z": "editor::ToggleSoftWrap",
+      "ctrl-k z": "editor::ToggleSoftWrap",
       "ctrl-f": "buffer_search::Deploy",
       "ctrl-h": ["buffer_search::Deploy", { "replace_enabled": true }],
       // "cmd-e": ["buffer_search::Deploy", { "focus": false }],
@@ -147,9 +171,13 @@
   {
     "context": "AssistantPanel",
     "bindings": {
+      "ctrl-k c": "assistant::CopyCode",
       "ctrl-g": "search::SelectNextMatch",
       "ctrl-shift-g": "search::SelectPrevMatch",
-      "alt-m": "assistant::ToggleModelSelector"
+      "ctrl-shift-m": "assistant::ToggleModelSelector",
+      "ctrl-k h": "assistant::DeployHistory",
+      "ctrl-k l": "assistant::DeployPromptLibrary",
+      "ctrl-n": "assistant::NewContext"
     }
   },
   {
@@ -173,7 +201,7 @@
     }
   },
   {
-    "context": "BufferSearchBar && in_replace",
+    "context": "BufferSearchBar && in_replace > Editor",
     "bindings": {
       "enter": "search::ReplaceNext",
       "ctrl-enter": "search::ReplaceAll"
@@ -224,12 +252,18 @@
     "bindings": {
       "ctrl-pageup": "pane::ActivatePrevItem",
       "ctrl-pagedown": "pane::ActivateNextItem",
+      "ctrl-shift-pageup": "pane::SwapItemLeft",
+      "ctrl-shift-pagedown": "pane::SwapItemRight",
+      "back": "pane::GoBack",
+      "forward": "pane::GoForward",
       "ctrl-w": "pane::CloseActiveItem",
       "ctrl-f4": "pane::CloseActiveItem",
-      "alt-ctrl-t": "pane::CloseInactiveItems",
+      "alt-ctrl-t": ["pane::CloseInactiveItems", { "close_pinned": false }],
       "alt-ctrl-shift-w": "workspace::CloseInactiveTabsAndPanes",
-      "ctrl-k u": "pane::CloseCleanItems",
-      "ctrl-k w": "pane::CloseAllItems",
+      "ctrl-k e": ["pane::CloseItemsToTheLeft", { "close_pinned": false }],
+      "ctrl-k t": ["pane::CloseItemsToTheRight", { "close_pinned": false }],
+      "ctrl-k u": ["pane::CloseCleanItems", { "close_pinned": false }],
+      "ctrl-k w": ["pane::CloseAllItems", { "close_pinned": false }],
       "ctrl-shift-f": "project_search::ToggleFocus",
       "ctrl-alt-g": "search::SelectNextMatch",
       "ctrl-alt-shift-g": "search::SelectPrevMatch",
@@ -241,14 +275,8 @@
       "alt-r": "search::ToggleRegex",
       "alt-ctrl-f": "project_search::ToggleFilters",
       "ctrl-alt-shift-r": "search::ToggleRegex",
-      "ctrl-alt-shift-x": "search::ToggleRegex"
-    }
-  },
-  {
-    "context": "Terminal",
-    "bindings": {
-      "ctrl-w": ["terminal::SendKeystroke", "ctrl-w"],
-      "ctrl-e": ["terminal::SendKeystroke", "ctrl-e"]
+      "ctrl-alt-shift-x": "search::ToggleRegex",
+      "ctrl-k shift-enter": "pane::TogglePinTab"
     }
   },
   // Bindings from VS Code
@@ -291,9 +319,22 @@
       "ctrl-shift-\\": "editor::MoveToEnclosingBracket",
       "ctrl-shift-[": "editor::Fold",
       "ctrl-shift-]": "editor::UnfoldLines",
+      "ctrl-k ctrl-l": "editor::ToggleFold",
+      "ctrl-k ctrl-[": "editor::FoldRecursive",
+      "ctrl-k ctrl-]": "editor::UnfoldRecursive",
+      "ctrl-k ctrl-1": ["editor::FoldAtLevel", { "level": 1 }],
+      "ctrl-k ctrl-2": ["editor::FoldAtLevel", { "level": 2 }],
+      "ctrl-k ctrl-3": ["editor::FoldAtLevel", { "level": 3 }],
+      "ctrl-k ctrl-4": ["editor::FoldAtLevel", { "level": 4 }],
+      "ctrl-k ctrl-5": ["editor::FoldAtLevel", { "level": 5 }],
+      "ctrl-k ctrl-6": ["editor::FoldAtLevel", { "level": 6 }],
+      "ctrl-k ctrl-7": ["editor::FoldAtLevel", { "level": 7 }],
+      "ctrl-k ctrl-8": ["editor::FoldAtLevel", { "level": 8 }],
+      "ctrl-k ctrl-9": ["editor::FoldAtLevel", { "level": 9 }],
+      "ctrl-k ctrl-0": "editor::FoldAll",
+      "ctrl-k ctrl-j": "editor::UnfoldAll",
       "ctrl-space": "editor::ShowCompletions",
       "ctrl-.": "editor::ToggleCodeActions",
-      "alt-ctrl-r": "editor::RevealInFileManager",
       "ctrl-k r": "editor::RevealInFileManager",
       "ctrl-k p": "editor::CopyPath",
       "ctrl-\\": "pane::SplitRight",
@@ -336,6 +377,7 @@
       // Change the default action on `menu::Confirm` by setting the parameter
       // "alt-ctrl-o": ["projects::OpenRecent", { "create_new_window": true }],
       "alt-ctrl-o": "projects::OpenRecent",
+      "alt-ctrl-shift-o": "projects::OpenRemote",
       "alt-ctrl-shift-b": "branches::OpenRecent",
       "ctrl-~": "workspace::NewTerminal",
       "ctrl-s": "workspace::Save",
@@ -369,7 +411,7 @@
       "ctrl-shift-p": "command_palette::Toggle",
       "f1": "command_palette::Toggle",
       "ctrl-shift-m": "diagnostics::Deploy",
-      "ctrl-shift-e": "project_panel::ToggleFocus",
+      "ctrl-shift-e": "pane::RevealInProjectPanel",
       "ctrl-shift-b": "outline_panel::ToggleFocus",
       "ctrl-?": "assistant::ToggleFocus",
       "ctrl-alt-s": "workspace::SaveAll",
@@ -384,8 +426,20 @@
       "ctrl-k shift-up": ["workspace::SwapPaneInDirection", "Up"],
       "ctrl-k shift-down": ["workspace::SwapPaneInDirection", "Down"],
       "ctrl-shift-x": "zed::Extensions",
+      "ctrl-shift-r": "task::Rerun",
+      "ctrl-alt-r": "task::Rerun",
       "alt-t": "task::Rerun",
-      "alt-shift-t": "task::Spawn"
+      "alt-shift-t": "task::Spawn",
+      "alt-shift-r": ["task::Spawn", { "reveal_target": "center" }]
+      // also possible to spawn tasks by name:
+      // "foo-bar": ["task::Spawn", { "task_name": "MyTask", "reveal_target": "dock" }]
+    }
+  },
+  {
+    "context": "ApplicationMenu",
+    "bindings": {
+      "left": ["app_menu::NavigateApplicationMenuInDirection", "Left"],
+      "right": ["app_menu::NavigateApplicationMenuInDirection", "Right"]
     }
   },
   // Bindings from Sublime Text
@@ -428,13 +482,15 @@
   },
   {
     "context": "Editor && showing_completions",
+    "use_key_equivalents": true,
     "bindings": {
       "enter": "editor::ConfirmCompletion",
-      "tab": "editor::ConfirmCompletion"
+      "tab": "editor::ComposeCompletion"
     }
   },
   {
     "context": "Editor && inline_completion && !showing_completions",
+    "use_key_equivalents": true,
     "bindings": {
       "tab": "editor::AcceptInlineCompletion"
     }
@@ -460,10 +516,14 @@
   {
     "bindings": {
       "ctrl-alt-shift-f": "workspace::FollowNextCollaborator",
-      // TODO: Move this to a dock open action
-      "ctrl-shift-c": "collab_panel::ToggleFocus",
       "ctrl-alt-i": "zed::DebugElements",
       "ctrl-:": "editor::ToggleInlayHints"
+    }
+  },
+  {
+    "context": "!Terminal",
+    "bindings": {
+      "ctrl-shift-c": "collab_panel::ToggleFocus"
     }
   },
   {
@@ -478,15 +538,24 @@
     }
   },
   {
+    "context": "ProposedChangesEditor",
+    "bindings": {
+      "ctrl-shift-y": "editor::ApplyDiffHunk",
+      "ctrl-alt-a": "editor::ApplyAllDiffHunks"
+    }
+  },
+  {
     "context": "Editor && jupyter && !ContextEditor",
     "bindings": {
-      "ctrl-shift-enter": "repl::Run"
+      "ctrl-shift-enter": "repl::Run",
+      "ctrl-alt-enter": "repl::RunInPlace"
     }
   },
   {
     "context": "ContextEditor > Editor",
     "bindings": {
       "ctrl-enter": "assistant::Assist",
+      "ctrl-shift-enter": "assistant::Edit",
       "ctrl-s": "workspace::Save",
       "ctrl->": "assistant::QuoteSelection",
       "ctrl-<": "assistant::InsertIntoEditor",
@@ -497,13 +566,20 @@
     }
   },
   {
+    "context": "PromptEditor",
+    "bindings": {
+      "ctrl-[": "assistant::CyclePreviousInlineAssist",
+      "ctrl-]": "assistant::CycleNextInlineAssist"
+    }
+  },
+  {
     "context": "ProjectSearchBar && !in_replace",
     "bindings": {
       "ctrl-enter": "project_search::SearchInNew"
     }
   },
   {
-    "context": "OutlinePanel",
+    "context": "OutlinePanel && not_editing",
     "bindings": {
       "escape": "menu::Cancel",
       "left": "outline_panel::CollapseSelectedEntry",
@@ -513,7 +589,9 @@
       "alt-ctrl-r": "outline_panel::RevealInFileManager",
       "space": "outline_panel::Open",
       "shift-down": "menu::SelectNext",
-      "shift-up": "menu::SelectPrev"
+      "shift-up": "menu::SelectPrev",
+      "alt-enter": "editor::OpenExcerpts",
+      "ctrl-k enter": "editor::OpenExcerptsSplit"
     }
   },
   {
@@ -523,25 +601,33 @@
       "right": "project_panel::ExpandSelectedEntry",
       "ctrl-n": "project_panel::NewFile",
       "alt-ctrl-n": "project_panel::NewDirectory",
-      "ctrl-x": "project_panel::Cut",
-      "ctrl-c": "project_panel::Copy",
       "ctrl-insert": "project_panel::Copy",
-      "ctrl-v": "project_panel::Paste",
       "shift-insert": "project_panel::Paste",
       "ctrl-alt-c": "project_panel::CopyPath",
       "alt-ctrl-shift-c": "project_panel::CopyRelativePath",
-      "f2": "project_panel::Rename",
       "enter": "project_panel::Rename",
       "backspace": ["project_panel::Trash", { "skip_prompt": false }],
       "shift-delete": ["project_panel::Delete", { "skip_prompt": false }],
-      "delete": ["project_panel::Trash", { "skip_prompt": false }],
       "ctrl-backspace": ["project_panel::Delete", { "skip_prompt": false }],
       "ctrl-delete": ["project_panel::Delete", { "skip_prompt": false }],
       "alt-ctrl-r": "project_panel::RevealInFileManager",
-      "alt-shift-f": "project_panel::NewSearchInDirectory",
+      "ctrl-shift-enter": "project_panel::OpenWithSystem",
+      "ctrl-shift-e": "project_panel::ToggleFocus",
+      "ctrl-shift-f": "project_panel::NewSearchInDirectory",
       "shift-down": "menu::SelectNext",
       "shift-up": "menu::SelectPrev",
       "escape": "menu::Cancel"
+    }
+  },
+  {
+    // Separate block with same context so these display in context menus
+    "context": "ProjectPanel",
+    "bindings": {
+      "f2": "project_panel::Rename",
+      "ctrl-c": "project_panel::Copy",
+      "ctrl-x": "project_panel::Cut",
+      "ctrl-v": "project_panel::Paste",
+      "delete": ["project_panel::Trash", { "skip_prompt": false }]
     }
   },
   {
@@ -584,7 +670,28 @@
   },
   {
     "context": "FileFinder",
-    "bindings": { "ctrl-shift-p": "file_finder::SelectPrev" }
+    "bindings": {
+      "ctrl": "file_finder::ToggleMenu"
+    }
+  },
+  {
+    "context": "FileFinder && !menu_open",
+    "bindings": {
+      "ctrl-shift-p": "file_finder::SelectPrev",
+      "ctrl-j": "pane::SplitDown",
+      "ctrl-k": "pane::SplitUp",
+      "ctrl-h": "pane::SplitLeft",
+      "ctrl-l": "pane::SplitRight"
+    }
+  },
+  {
+    "context": "FileFinder && menu_open",
+    "bindings": {
+      "j": "pane::SplitDown",
+      "k": "pane::SplitUp",
+      "h": "pane::SplitLeft",
+      "l": "pane::SplitRight"
+    }
   },
   {
     "context": "TabSwitcher",
@@ -599,12 +706,16 @@
     "context": "Terminal",
     "bindings": {
       "ctrl-alt-space": "terminal::ShowCharacterPalette",
-      "shift-ctrl-c": "terminal::Copy",
       "ctrl-insert": "terminal::Copy",
-      "ctrl-a": "editor::SelectAll",
-      "shift-ctrl-v": "terminal::Paste",
       "shift-insert": "terminal::Paste",
       "ctrl-enter": "assistant::InlineAssist",
+      // Overrides for conflicting keybindings
+      "ctrl-w": ["terminal::SendKeystroke", "ctrl-w"],
+      "ctrl-shift-a": "editor::SelectAll",
+      "ctrl-shift-f": "buffer_search::Deploy",
+      "ctrl-shift-l": "terminal::Clear",
+      "ctrl-shift-w": "pane::CloseActiveItem",
+      "ctrl-e": ["terminal::SendKeystroke", "ctrl-e"],
       "up": ["terminal::SendKeystroke", "up"],
       "pageup": ["terminal::SendKeystroke", "pageup"],
       "down": ["terminal::SendKeystroke", "down"],
@@ -617,7 +728,16 @@
       "shift-up": "terminal::ScrollLineUp",
       "shift-down": "terminal::ScrollLineDown",
       "shift-home": "terminal::ScrollToTop",
-      "shift-end": "terminal::ScrollToBottom"
+      "shift-end": "terminal::ScrollToBottom",
+      "ctrl-shift-space": "terminal::ToggleViMode"
+    }
+  },
+  {
+    // Separate block with same context so these display in context menus
+    "context": "Terminal",
+    "bindings": {
+      "ctrl-shift-c": "terminal::Copy",
+      "ctrl-shift-v": "terminal::Paste"
     }
   }
 ]

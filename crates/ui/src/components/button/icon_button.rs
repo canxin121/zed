@@ -1,7 +1,9 @@
+#![allow(missing_docs)]
 use gpui::{AnyView, DefiniteLength};
 
+use super::button_like::{ButtonCommon, ButtonLike, ButtonSize, ButtonStyle};
 use crate::{prelude::*, ElevationIndex, SelectableButton};
-use crate::{ButtonCommon, ButtonLike, ButtonSize, ButtonStyle, IconName, IconSize};
+use crate::{IconName, IconSize};
 
 use super::button_icon::ButtonIcon;
 
@@ -64,9 +66,9 @@ impl Disableable for IconButton {
     }
 }
 
-impl Selectable for IconButton {
-    fn selected(mut self, selected: bool) -> Self {
-        self.base = self.base.selected(selected);
+impl Toggleable for IconButton {
+    fn toggle_state(mut self, selected: bool) -> Self {
+        self.base = self.base.toggle_state(selected);
         self
     }
 }
@@ -155,7 +157,7 @@ impl RenderOnce for IconButton {
             .child(
                 ButtonIcon::new(self.icon)
                     .disabled(is_disabled)
-                    .selected(is_selected)
+                    .toggle_state(is_selected)
                     .selected_icon(self.selected_icon)
                     .when_some(selected_style, |this, style| this.selected_style(style))
                     .size(self.icon_size)

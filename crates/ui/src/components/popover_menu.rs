@@ -1,17 +1,19 @@
+#![allow(missing_docs)]
+
 use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
-    anchored, deferred, div, point, prelude::FluentBuilder, px, size, AnchorCorner, AnyElement,
-    Bounds, DismissEvent, DispatchPhase, Element, ElementId, GlobalElementId, HitboxId,
-    InteractiveElement, IntoElement, LayoutId, Length, ManagedView, MouseDownEvent, ParentElement,
-    Pixels, Point, Style, View, VisualContext, WindowContext,
+    anchored, deferred, div, point, prelude::FluentBuilder, px, size, AnyElement, Bounds, Corner,
+    DismissEvent, DispatchPhase, Element, ElementId, GlobalElementId, HitboxId, InteractiveElement,
+    IntoElement, LayoutId, Length, ManagedView, MouseDownEvent, ParentElement, Pixels, Point,
+    Style, View, VisualContext, WindowContext,
 };
 
 use crate::prelude::*;
 
-pub trait PopoverTrigger: IntoElement + Clickable + Selectable + 'static {}
+pub trait PopoverTrigger: IntoElement + Clickable + Toggleable + 'static {}
 
-impl<T: IntoElement + Clickable + Selectable + 'static> PopoverTrigger for T {}
+impl<T: IntoElement + Clickable + Toggleable + 'static> PopoverTrigger for T {}
 
 pub struct PopoverMenuHandle<M>(Rc<RefCell<Option<PopoverMenuHandleState<M>>>>);
 
@@ -56,6 +58,23 @@ impl<M: ManagedView> PopoverMenuHandle<M> {
             }
         }
     }
+
+    pub fn is_deployed(&self) -> bool {
+        self.0
+            .borrow()
+            .as_ref()
+            .map_or(false, |state| state.menu.borrow().as_ref().is_some())
+    }
+
+    pub fn is_focused(&self, cx: &WindowContext) -> bool {
+        self.0.borrow().as_ref().map_or(false, |state| {
+            state
+                .menu
+                .borrow()
+                .as_ref()
+                .map_or(false, |view| view.focus_handle(cx).is_focused(cx))
+        })
+    }
 }
 
 pub struct PopoverMenu<M: ManagedView> {
@@ -70,8 +89,8 @@ pub struct PopoverMenu<M: ManagedView> {
         >,
     >,
     menu_builder: Option<Rc<dyn Fn(&mut WindowContext) -> Option<View<M>> + 'static>>,
-    anchor: AnchorCorner,
-    attach: Option<AnchorCorner>,
+    anchor: Corner,
+    attach: Option<Corner>,
     offset: Option<Point<Pixels>>,
     trigger_handle: Option<PopoverMenuHandle<M>>,
     full_width: bool,
@@ -84,7 +103,7 @@ impl<M: ManagedView> PopoverMenu<M> {
             id: id.into(),
             child_builder: None,
             menu_builder: None,
-            anchor: AnchorCorner::TopLeft,
+            anchor: Corner::TopLeft,
             attach: None,
             offset: None,
             trigger_handle: None,
@@ -110,7 +129,7 @@ impl<M: ManagedView> PopoverMenu<M> {
     pub fn trigger<T: PopoverTrigger>(mut self, t: T) -> Self {
         self.child_builder = Some(Box::new(|menu, builder| {
             let open = menu.borrow().is_some();
-            t.selected(open)
+            t.toggle_state(open)
                 .when_some(builder, |el, builder| {
                     el.on_click(move |_, cx| show_menu(&builder, &menu, cx))
                 })
@@ -121,13 +140,13 @@ impl<M: ManagedView> PopoverMenu<M> {
 
     /// anchor defines which corner of the menu to anchor to the attachment point
     /// (by default the cursor position, but see attach)
-    pub fn anchor(mut self, anchor: AnchorCorner) -> Self {
+    pub fn anchor(mut self, anchor: Corner) -> Self {
         self.anchor = anchor;
         self
     }
 
     /// attach defines which corner of the handle to attach the menu's anchor to
-    pub fn attach(mut self, attach: AnchorCorner) -> Self {
+    pub fn attach(mut self, attach: Corner) -> Self {
         self.attach = Some(attach);
         self
     }
@@ -138,12 +157,12 @@ impl<M: ManagedView> PopoverMenu<M> {
         self
     }
 
-    fn resolved_attach(&self) -> AnchorCorner {
-        self.attach.unwrap_or_else(|| match self.anchor {
-            AnchorCorner::TopLeft => AnchorCorner::BottomLeft,
-            AnchorCorner::TopRight => AnchorCorner::BottomRight,
-            AnchorCorner::BottomLeft => AnchorCorner::TopLeft,
-            AnchorCorner::BottomRight => AnchorCorner::TopRight,
+    fn resolved_attach(&self) -> Corner {
+        self.attach.unwrap_or(match self.anchor {
+            Corner::TopLeft => Corner::BottomLeft,
+            Corner::TopRight => Corner::BottomRight,
+            Corner::BottomLeft => Corner::TopLeft,
+            Corner::BottomRight => Corner::TopRight,
         })
     }
 
@@ -152,8 +171,8 @@ impl<M: ManagedView> PopoverMenu<M> {
             // Default offset = 4px padding + 1px border
             let offset = rems_from_px(5.) * cx.rem_size();
             match self.anchor {
-                AnchorCorner::TopRight | AnchorCorner::BottomRight => point(offset, px(0.)),
-                AnchorCorner::TopLeft | AnchorCorner::BottomLeft => point(-offset, px(0.)),
+                Corner::TopRight | Corner::BottomRight => point(offset, px(0.)),
+                Corner::TopLeft | Corner::BottomLeft => point(-offset, px(0.)),
             }
         })
     }
@@ -208,14 +227,15 @@ impl<M> Default for PopoverMenuElementState<M> {
     }
 }
 
-pub struct PopoverMenuFrameState {
+pub struct PopoverMenuFrameState<M: ManagedView> {
     child_layout_id: Option<LayoutId>,
     child_element: Option<AnyElement>,
     menu_element: Option<AnyElement>,
+    menu_handle: Rc<RefCell<Option<View<M>>>>,
 }
 
 impl<M: ManagedView> Element for PopoverMenu<M> {
-    type RequestLayoutState = PopoverMenuFrameState;
+    type RequestLayoutState = PopoverMenuFrameState<M>;
     type PrepaintState = Option<HitboxId>;
 
     fn id(&self) -> Option<ElementId> {
@@ -234,10 +254,12 @@ impl<M: ManagedView> Element for PopoverMenu<M> {
                 let mut menu_layout_id = None;
 
                 let menu_element = element_state.menu.borrow_mut().as_mut().map(|menu| {
-                    let mut anchored = anchored().snap_to_window().anchor(self.anchor);
+                    let mut anchored = anchored()
+                        .snap_to_window_with_margin(px(8.))
+                        .anchor(self.anchor);
                     if let Some(child_bounds) = element_state.child_bounds {
                         anchored = anchored.position(
-                            self.resolved_attach().corner(child_bounds) + self.resolved_offset(cx),
+                            child_bounds.corner(self.resolved_attach()) + self.resolved_offset(cx),
                         );
                     }
                     let mut element = deferred(anchored.child(div().occlude().child(menu.clone())))
@@ -280,6 +302,7 @@ impl<M: ManagedView> Element for PopoverMenu<M> {
                             child_element,
                             child_layout_id,
                             menu_element,
+                            menu_handle: element_state.menu.clone(),
                         },
                     ),
                     element_state,
@@ -303,7 +326,7 @@ impl<M: ManagedView> Element for PopoverMenu<M> {
             menu.prepaint(cx);
         }
 
-        let hitbox_id = request_layout.child_layout_id.map(|layout_id| {
+        request_layout.child_layout_id.map(|layout_id| {
             let bounds = cx.layout_bounds(layout_id);
             cx.with_element_state(global_id.unwrap(), |element_state, _cx| {
                 let mut element_state: PopoverMenuElementState<M> = element_state.unwrap();
@@ -312,9 +335,7 @@ impl<M: ManagedView> Element for PopoverMenu<M> {
             });
 
             cx.insert_hitbox(bounds, false).id
-        });
-
-        hitbox_id
+        })
     }
 
     fn paint(
@@ -333,11 +354,17 @@ impl<M: ManagedView> Element for PopoverMenu<M> {
             menu.paint(cx);
 
             if let Some(child_hitbox) = *child_hitbox {
+                let menu_handle = request_layout.menu_handle.clone();
                 // Mouse-downing outside the menu dismisses it, so we don't
                 // want a click on the toggle to re-open it.
                 cx.on_mouse_event(move |_: &MouseDownEvent, phase, cx| {
                     if phase == DispatchPhase::Bubble && child_hitbox.is_hovered(cx) {
-                        cx.stop_propagation()
+                        if let Some(menu) = menu_handle.borrow().as_ref() {
+                            menu.update(cx, |_, cx| {
+                                cx.emit(DismissEvent);
+                            });
+                        }
+                        cx.stop_propagation();
                     }
                 })
             }

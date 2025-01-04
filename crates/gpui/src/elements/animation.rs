@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::{AnyElement, Element, ElementId, GlobalElementId, IntoElement};
+use crate::{AnyElement, Element, ElementId, GlobalElementId, IntoElement, WindowContext};
 
 pub use easing::*;
 
@@ -104,7 +104,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
     fn request_layout(
         &mut self,
         global_id: Option<&GlobalElementId>,
-        cx: &mut crate::WindowContext,
+        cx: &mut WindowContext,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
         cx.with_element_state(global_id.unwrap(), |state, cx| {
             let state = state.unwrap_or_else(|| AnimationState {
@@ -119,13 +119,13 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                     done = true;
                     delta = 1.0;
                 } else {
-                    delta = delta % 1.0;
+                    delta %= 1.0;
                 }
             }
             let delta = (self.animation.easing)(delta);
 
             debug_assert!(
-                delta >= 0.0 && delta <= 1.0,
+                (0.0..=1.0).contains(&delta),
                 "delta should always be between 0 and 1"
             );
 
@@ -133,14 +133,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
             let mut element = (self.animator)(element, delta).into_any_element();
 
             if !done {
-                let parent_id = cx.parent_view_id();
-                cx.on_next_frame(move |cx| {
-                    if let Some(parent_id) = parent_id {
-                        cx.notify(parent_id)
-                    } else {
-                        cx.refresh()
-                    }
-                })
+                cx.request_animation_frame();
             }
 
             ((element.request_layout(cx), element), state)
@@ -152,7 +145,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         _id: Option<&GlobalElementId>,
         _bounds: crate::Bounds<crate::Pixels>,
         element: &mut Self::RequestLayoutState,
-        cx: &mut crate::WindowContext,
+        cx: &mut WindowContext,
     ) -> Self::PrepaintState {
         element.prepaint(cx);
     }
@@ -163,13 +156,15 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         _bounds: crate::Bounds<crate::Pixels>,
         element: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
-        cx: &mut crate::WindowContext,
+        cx: &mut WindowContext,
     ) {
         element.paint(cx);
     }
 }
 
 mod easing {
+    use std::f32::consts::PI;
+
     /// The linear easing function, or delta itself
     pub fn linear(delta: f32) -> f32 {
         delta
@@ -198,6 +193,22 @@ mod easing {
             } else {
                 easing((1.0 - delta) * 2.0)
             }
+        }
+    }
+
+    /// A custom easing function for pulsating alpha that slows down as it approaches 0.1
+    pub fn pulsating_between(min: f32, max: f32) -> impl Fn(f32) -> f32 {
+        let range = max - min;
+
+        move |delta| {
+            // Use a combination of sine and cubic functions for a more natural breathing rhythm
+            let t = (delta * 2.0 * PI).sin();
+            let breath = (t * t * t + t) / 2.0;
+
+            // Map the breath to our desired alpha range
+            let normalized_alpha = (breath + 1.0) / 2.0;
+
+            min + (normalized_alpha * range)
         }
     }
 }

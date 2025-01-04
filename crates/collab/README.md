@@ -8,9 +8,14 @@ It contains our back-end logic for collaboration, to which we connect from the Z
 
 ## Database setup
 
-Before you can run the collab server locally, you'll need to set up a zed Postgres database.
+Before you can run the collab server locally, you'll need to set up a zed Postgres database. Follow the steps sequentially:
 
-```
+1. Ensure you have postgres installed. If not, install with `brew install postgresql@15`.
+2. Follow the steps on Brew's formula and verify your `$PATH` contains `/opt/homebrew/opt/postgresql@15/bin`.
+3. If you hadn't done it before, create the `postgres` user with `createuser -s postgres`.
+4. You are now ready to run the `bootstrap` script:
+
+```sh
 script/bootstrap
 ```
 
@@ -23,8 +28,7 @@ To use a different set of admin users, create `crates/collab/seed.json`.
 ```json
 {
   "admins": ["yourgithubhere"],
-  "channels": ["zed"],
-  "number_of_users": 20
+  "channels": ["zed"]
 }
 ```
 
@@ -32,13 +36,13 @@ To use a different set of admin users, create `crates/collab/seed.json`.
 
 In one terminal, run Zed's collaboration server and the livekit dev server:
 
-```
+```sh
 foreman start
 ```
 
 In a second terminal, run two or more instances of Zed.
 
-```
+```sh
 script/zed-local -2
 ```
 
@@ -64,7 +68,7 @@ You can tell what is currently deployed with `./script/what-is-deployed`.
 
 To create a new migration:
 
-```
+```sh
 ./script/create-migration <name>
 ```
 

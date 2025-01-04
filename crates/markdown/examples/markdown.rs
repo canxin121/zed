@@ -1,15 +1,15 @@
 use assets::Assets;
-use gpui::{prelude::*, rgb, App, KeyBinding, StyleRefinement, Task, View, WindowOptions};
+use gpui::{prelude::*, rgb, App, KeyBinding, StyleRefinement, View, WindowOptions};
 use language::{language_settings::AllLanguageSettings, LanguageRegistry};
 use markdown::{Markdown, MarkdownStyle};
-use node_runtime::FakeNodeRuntime;
+use node_runtime::NodeRuntime;
 use settings::SettingsStore;
 use std::sync::Arc;
 use theme::LoadThemes;
 use ui::prelude::*;
 use ui::{div, WindowContext};
 
-const MARKDOWN_EXAMPLE: &'static str = r#"
+const MARKDOWN_EXAMPLE: &str = r#"
 # Markdown Example Document
 
 ## Headings
@@ -54,7 +54,7 @@ They can also be detected automatically, for example https://zed.dev/blog.
 ## Images
 Images are like links, but with an exclamation mark `!` in front.
 
-```todo!
+```markdown
 ![This is an image](/images/logo.png)
 ```
 
@@ -102,11 +102,10 @@ pub fn main() {
         });
         cx.bind_keys([KeyBinding::new("cmd-c", markdown::Copy, None)]);
 
-        let node_runtime = FakeNodeRuntime::new();
+        let node_runtime = NodeRuntime::unavailable();
         theme::init(LoadThemes::JustBase, cx);
 
-        let language_registry =
-            LanguageRegistry::new(Task::ready(()), cx.background_executor().clone());
+        let language_registry = LanguageRegistry::new(cx.background_executor().clone());
         language_registry.set_theme(cx.theme().clone());
         let language_registry = Arc::new(language_registry);
         languages::init(language_registry.clone(), node_runtime, cx);
@@ -179,7 +178,7 @@ impl MarkdownExample {
         cx: &mut WindowContext,
     ) -> Self {
         let markdown =
-            cx.new_view(|cx| Markdown::new(text, style, Some(language_registry), cx, None));
+            cx.new_view(|cx| Markdown::new(text, style, Some(language_registry), None, cx));
         Self { markdown }
     }
 }

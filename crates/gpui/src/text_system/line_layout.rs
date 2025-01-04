@@ -1,4 +1,4 @@
-use crate::{point, px, FontId, GlyphId, Pixels, PlatformTextSystem, Point, Size};
+use crate::{point, px, FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
@@ -8,6 +8,8 @@ use std::{
     ops::Range,
     sync::Arc,
 };
+
+use super::LineWrapper;
 
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
@@ -27,7 +29,7 @@ pub struct LineLayout {
 }
 
 /// A run of text that has been shaped .
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ShapedRun {
     /// The font id for this run
     pub font_id: FontId,
@@ -152,9 +154,18 @@ impl LineLayout {
                 continue;
             }
 
-            if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                last_candidate_ix = Some(boundary);
-                last_candidate_x = x;
+            // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
+            // but there are some differences, so we have to duplicate the code here.
+            if LineWrapper::is_word_char(ch) {
+                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
+                    last_candidate_ix = Some(boundary);
+                    last_candidate_x = x;
+                }
+            } else {
+                if ch != ' ' && first_non_whitespace_ix.is_some() {
+                    last_candidate_ix = Some(boundary);
+                    last_candidate_x = x;
+                }
             }
 
             if ch != ' ' && first_non_whitespace_ix.is_none() {
@@ -409,15 +420,19 @@ impl LineLayoutCache {
         curr_frame.used_wrapped_lines.clear();
     }
 
-    pub fn layout_wrapped_line(
+    pub fn layout_wrapped_line<Text>(
         &self,
-        text: &str,
+        text: Text,
         font_size: Pixels,
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
-    ) -> Arc<WrappedLineLayout> {
+    ) -> Arc<WrappedLineLayout>
+    where
+        Text: AsRef<str>,
+        SharedString: From<Text>,
+    {
         let key = &CacheKeyRef {
-            text,
+            text: text.as_ref(),
             font_size,
             runs,
             wrap_width,
@@ -438,8 +453,8 @@ impl LineLayoutCache {
             layout
         } else {
             drop(current_frame);
-
-            let unwrapped_layout = self.layout_line(text, font_size, runs);
+            let text = SharedString::from(text);
+            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs);
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
                 unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width)
             } else {
@@ -451,7 +466,7 @@ impl LineLayoutCache {
                 wrap_width,
             });
             let key = Arc::new(CacheKey {
-                text: text.into(),
+                text,
                 font_size,
                 runs: SmallVec::from(runs),
                 wrap_width,
@@ -467,9 +482,18 @@ impl LineLayoutCache {
         }
     }
 
-    pub fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> Arc<LineLayout> {
+    pub fn layout_line<Text>(
+        &self,
+        text: Text,
+        font_size: Pixels,
+        runs: &[FontRun],
+    ) -> Arc<LineLayout>
+    where
+        Text: AsRef<str>,
+        SharedString: From<Text>,
+    {
         let key = &CacheKeyRef {
-            text,
+            text: text.as_ref(),
             font_size,
             runs,
             wrap_width: None,
@@ -486,9 +510,13 @@ impl LineLayoutCache {
             current_frame.used_lines.push(key);
             layout
         } else {
-            let layout = Arc::new(self.platform_text_system.layout_line(text, font_size, runs));
+            let text = SharedString::from(text);
+            let layout = Arc::new(
+                self.platform_text_system
+                    .layout_line(&text, font_size, runs),
+            );
             let key = Arc::new(CacheKey {
-                text: text.into(),
+                text,
                 font_size,
                 runs: SmallVec::from(runs),
                 wrap_width: None,
@@ -513,7 +541,7 @@ trait AsCacheKeyRef {
 
 #[derive(Clone, Debug, Eq)]
 struct CacheKey {
-    text: String,
+    text: SharedString,
     font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,

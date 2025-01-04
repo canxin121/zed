@@ -1,6 +1,9 @@
+#![allow(missing_docs)]
 use gpui::{AnyView, DefiniteLength};
 
-use crate::{prelude::*, ElevationIndex, IconPosition, KeyBinding, Spacing};
+use crate::{
+    prelude::*, Color, DynamicSpacing, ElevationIndex, IconPosition, KeyBinding, TintColor,
+};
 use crate::{
     ButtonCommon, ButtonLike, ButtonSize, ButtonStyle, IconName, IconSize, Label, LineHeightStyle,
 };
@@ -81,12 +84,15 @@ pub struct Button {
     label_color: Option<Color>,
     label_size: Option<LabelSize>,
     selected_label: Option<SharedString>,
+    selected_label_color: Option<Color>,
     icon: Option<IconName>,
     icon_position: Option<IconPosition>,
     icon_size: Option<IconSize>,
     icon_color: Option<Color>,
     selected_icon: Option<IconName>,
+    selected_icon_color: Option<Color>,
     key_binding: Option<KeyBinding>,
+    alpha: Option<f32>,
 }
 
 impl Button {
@@ -103,12 +109,15 @@ impl Button {
             label_color: None,
             label_size: None,
             selected_label: None,
+            selected_label_color: None,
             icon: None,
             icon_position: None,
             icon_size: None,
             icon_color: None,
             selected_icon: None,
+            selected_icon_color: None,
             key_binding: None,
+            alpha: None,
         }
     }
 
@@ -127,6 +136,12 @@ impl Button {
     /// Sets the label used when the button is in a selected state.
     pub fn selected_label<L: Into<SharedString>>(mut self, label: impl Into<Option<L>>) -> Self {
         self.selected_label = label.into().map(Into::into);
+        self
+    }
+
+    /// Sets the label color used when the button is in a selected state.
+    pub fn selected_label_color(mut self, color: impl Into<Option<Color>>) -> Self {
+        self.selected_label_color = color.into();
         self
     }
 
@@ -160,14 +175,26 @@ impl Button {
         self
     }
 
+    /// Sets the icon color used when the button is in a selected state.
+    pub fn selected_icon_color(mut self, color: impl Into<Option<Color>>) -> Self {
+        self.selected_icon_color = color.into();
+        self
+    }
+
     /// Binds a key combination to the button for keyboard shortcuts.
     pub fn key_binding(mut self, key_binding: impl Into<Option<KeyBinding>>) -> Self {
         self.key_binding = key_binding.into();
         self
     }
+
+    /// Sets the alpha property of the color of label.
+    pub fn alpha(mut self, alpha: f32) -> Self {
+        self.alpha = Some(alpha);
+        self
+    }
 }
 
-impl Selectable for Button {
+impl Toggleable for Button {
     /// Sets the selected state of the button.
     ///
     /// This method allows the selection state of the button to be specified.
@@ -186,8 +213,8 @@ impl Selectable for Button {
     /// ```
     ///
     /// Use [`selected_style`](Button::selected_style) to change the style of the button when it is selected.
-    fn selected(mut self, selected: bool) -> Self {
-        self.base = self.base.selected(selected);
+    fn toggle_state(mut self, selected: bool) -> Self {
+        self.base = self.base.toggle_state(selected);
         self
     }
 }
@@ -366,32 +393,34 @@ impl RenderOnce for Button {
         let label_color = if is_disabled {
             Color::Disabled
         } else if is_selected {
-            Color::Selected
+            self.selected_label_color.unwrap_or(Color::Selected)
         } else {
             self.label_color.unwrap_or_default()
         };
 
         self.base.child(
             h_flex()
-                .gap(Spacing::Small.rems(cx))
+                .gap(DynamicSpacing::Base04.rems(cx))
                 .when(self.icon_position == Some(IconPosition::Start), |this| {
                     this.children(self.icon.map(|icon| {
                         ButtonIcon::new(icon)
                             .disabled(is_disabled)
-                            .selected(is_selected)
+                            .toggle_state(is_selected)
                             .selected_icon(self.selected_icon)
+                            .selected_icon_color(self.selected_icon_color)
                             .size(self.icon_size)
                             .color(self.icon_color)
                     }))
                 })
                 .child(
                     h_flex()
-                        .gap(Spacing::Medium.rems(cx))
+                        .gap(DynamicSpacing::Base06.rems(cx))
                         .justify_between()
                         .child(
                             Label::new(label)
                                 .color(label_color)
                                 .size(self.label_size.unwrap_or_default())
+                                .when_some(self.alpha, |this, alpha| this.alpha(alpha))
                                 .line_height_style(LineHeightStyle::UiLabel),
                         )
                         .children(self.key_binding),
@@ -400,12 +429,113 @@ impl RenderOnce for Button {
                     this.children(self.icon.map(|icon| {
                         ButtonIcon::new(icon)
                             .disabled(is_disabled)
-                            .selected(is_selected)
+                            .toggle_state(is_selected)
                             .selected_icon(self.selected_icon)
+                            .selected_icon_color(self.selected_icon_color)
                             .size(self.icon_size)
                             .color(self.icon_color)
                     }))
                 }),
         )
+    }
+}
+
+impl ComponentPreview for Button {
+    fn description() -> impl Into<Option<&'static str>> {
+        "A button allows users to take actions, and make choices, with a single tap."
+    }
+
+    fn examples(_: &mut WindowContext) -> Vec<ComponentExampleGroup<Self>> {
+        vec![
+            example_group_with_title(
+                "Styles",
+                vec![
+                    single_example("Default", Button::new("default", "Default")),
+                    single_example(
+                        "Filled",
+                        Button::new("filled", "Filled").style(ButtonStyle::Filled),
+                    ),
+                    single_example(
+                        "Subtle",
+                        Button::new("outline", "Subtle").style(ButtonStyle::Subtle),
+                    ),
+                    single_example(
+                        "Transparent",
+                        Button::new("transparent", "Transparent").style(ButtonStyle::Transparent),
+                    ),
+                ],
+            ),
+            example_group_with_title(
+                "Tinted",
+                vec![
+                    single_example(
+                        "Accent",
+                        Button::new("tinted_accent", "Accent")
+                            .style(ButtonStyle::Tinted(TintColor::Accent)),
+                    ),
+                    single_example(
+                        "Negative",
+                        Button::new("tinted_negative", "Negative")
+                            .style(ButtonStyle::Tinted(TintColor::Negative)),
+                    ),
+                    single_example(
+                        "Warning",
+                        Button::new("tinted_warning", "Warning")
+                            .style(ButtonStyle::Tinted(TintColor::Warning)),
+                    ),
+                    single_example(
+                        "Positive",
+                        Button::new("tinted_positive", "Positive")
+                            .style(ButtonStyle::Tinted(TintColor::Positive)),
+                    ),
+                ],
+            ),
+            example_group_with_title(
+                "States",
+                vec![
+                    single_example("Default", Button::new("default_state", "Default")),
+                    single_example(
+                        "Disabled",
+                        Button::new("disabled", "Disabled").disabled(true),
+                    ),
+                    single_example(
+                        "Selected",
+                        Button::new("selected", "Selected").toggle_state(true),
+                    ),
+                ],
+            ),
+            example_group_with_title(
+                "With Icons",
+                vec![
+                    single_example(
+                        "Icon Start",
+                        Button::new("icon_start", "Icon Start")
+                            .icon(IconName::Check)
+                            .icon_position(IconPosition::Start),
+                    ),
+                    single_example(
+                        "Icon End",
+                        Button::new("icon_end", "Icon End")
+                            .icon(IconName::Check)
+                            .icon_position(IconPosition::End),
+                    ),
+                    single_example(
+                        "Icon Color",
+                        Button::new("icon_color", "Icon Color")
+                            .icon(IconName::Check)
+                            .icon_color(Color::Accent),
+                    ),
+                    single_example(
+                        "Tinted Icons",
+                        Button::new("icon_color", "Delete")
+                            .style(ButtonStyle::Tinted(TintColor::Negative))
+                            .color(Color::Error)
+                            .icon_color(Color::Error)
+                            .icon(IconName::Trash)
+                            .icon_position(IconPosition::Start),
+                    ),
+                ],
+            ),
+        ]
     }
 }

@@ -1,29 +1,28 @@
 use crate::{
-    display_map::ToDisplayPoint, AnchorRangeExt, Autoscroll, DisplayPoint, Editor, MultiBuffer,
-    RowExt,
+    display_map::ToDisplayPoint, AnchorRangeExt, Autoscroll, DiffRowHighlight, DisplayPoint,
+    Editor, MultiBuffer, RowExt,
 };
 use collections::BTreeMap;
 use futures::Future;
+use git::diff::DiffHunkStatus;
 use gpui::{
-    AnyWindowHandle, AppContext, Keystroke, ModelContext, Pixels, Point, View, ViewContext,
-    VisualTestContext,
+    prelude::*, AnyWindowHandle, AppContext, Keystroke, ModelContext, Pixels, Point, View,
+    ViewContext, VisualTestContext, WindowHandle,
 };
-use indoc::indoc;
 use itertools::Itertools;
 use language::{Buffer, BufferSnapshot, LanguageRegistry};
-use multi_buffer::ExcerptRange;
+use multi_buffer::{ExcerptRange, ToPoint};
 use parking_lot::RwLock;
 use project::{FakeFs, Project};
 use std::{
     any::TypeId,
     ops::{Deref, DerefMut, Range},
+    path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
 };
-
-use ui::Context;
 use util::{
     assert_set_eq,
     test::{generate_marked_text, marked_text_ranges},
@@ -41,18 +40,19 @@ pub struct EditorTestContext {
 impl EditorTestContext {
     pub async fn new(cx: &mut gpui::TestAppContext) -> EditorTestContext {
         let fs = FakeFs::new(cx.executor());
-        // fs.insert_file("/file", "".to_owned()).await;
+        let root = Self::root_path();
         fs.insert_tree(
-            "/root",
+            root,
             serde_json::json!({
+                ".git": {},
                 "file": "",
             }),
         )
         .await;
-        let project = Project::test(fs, ["/root".as_ref()], cx).await;
+        let project = Project::test(fs.clone(), [root], cx).await;
         let buffer = project
             .update(cx, |project, cx| {
-                project.open_local_buffer("/root/file", cx)
+                project.open_local_buffer(root.join("file"), cx)
             })
             .await
             .unwrap();
@@ -62,6 +62,28 @@ impl EditorTestContext {
             editor.focus(cx);
             editor
         });
+        let editor_view = editor.root_view(cx).unwrap();
+
+        cx.run_until_parked();
+        Self {
+            cx: VisualTestContext::from_window(*editor.deref(), cx),
+            window: editor.into(),
+            editor: editor_view,
+            assertion_cx: AssertionContextManager::new(),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn root_path() -> &'static Path {
+        Path::new("C:\\root")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn root_path() -> &'static Path {
+        Path::new("/root")
+    }
+
+    pub async fn for_editor(editor: WindowHandle<Editor>, cx: &mut gpui::TestAppContext) -> Self {
         let editor_view = editor.root_view(cx).unwrap();
         Self {
             cx: VisualTestContext::from_window(*editor.deref(), cx),
@@ -75,7 +97,7 @@ impl EditorTestContext {
         cx: &mut gpui::TestAppContext,
         excerpts: [&str; COUNT],
     ) -> EditorTestContext {
-        let mut multibuffer = MultiBuffer::new(0, language::Capability::ReadWrite);
+        let mut multibuffer = MultiBuffer::new(language::Capability::ReadWrite);
         let buffer = cx.new_model(|cx| {
             for excerpt in excerpts.into_iter() {
                 let (text, ranges) = marked_text_ranges(excerpt, false);
@@ -120,8 +142,7 @@ impl EditorTestContext {
     where
         F: FnOnce(&Editor, &ViewContext<Editor>) -> T,
     {
-        self.editor
-            .update(&mut self.cx, |this, cx| read(&this, &cx))
+        self.editor.update(&mut self.cx, |this, cx| read(this, cx))
     }
 
     #[track_caller]
@@ -209,6 +230,7 @@ impl EditorTestContext {
         self.cx.background_executor.run_until_parked();
     }
 
+    #[track_caller]
     pub fn ranges(&mut self, marked_text: &str) -> Vec<Range<usize>> {
         let (unmarked_text, ranges) = marked_text_ranges(marked_text, false);
         assert_eq!(self.buffer_text(), unmarked_text);
@@ -255,8 +277,16 @@ impl EditorTestContext {
         snapshot.anchor_before(ranges[0].start)..snapshot.anchor_after(ranges[0].end)
     }
 
-    pub fn set_diff_base(&mut self, diff_base: Option<&str>) {
-        self.update_buffer(|buffer, cx| buffer.set_diff_base(diff_base.map(ToOwned::to_owned), cx));
+    pub fn set_diff_base(&mut self, diff_base: &str) {
+        self.cx.run_until_parked();
+        let fs = self
+            .update_editor(|editor, cx| editor.project.as_ref().unwrap().read(cx).fs().as_fake());
+        let path = self.update_buffer(|buffer, _| buffer.file().unwrap().path().clone());
+        fs.set_index_for_repo(
+            &Self::root_path().join(".git"),
+            &[(path.as_ref(), diff_base.to_string())],
+        );
+        self.cx.run_until_parked();
     }
 
     /// Change the editor's text and selections using a string containing
@@ -298,19 +328,100 @@ impl EditorTestContext {
         state_context
     }
 
+    /// Assert about the text of the editor, the selections, and the expanded
+    /// diff hunks.
+    ///
+    /// Diff hunks are indicated by lines starting with `+` and `-`.
+    #[track_caller]
+    pub fn assert_state_with_diff(&mut self, expected_diff: String) {
+        let has_diff_markers = expected_diff
+            .lines()
+            .any(|line| line.starts_with("+") || line.starts_with("-"));
+        let expected_diff_text = expected_diff
+            .split('\n')
+            .map(|line| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    String::new()
+                } else if has_diff_markers {
+                    line.to_string()
+                } else {
+                    format!("  {line}")
+                }
+            })
+            .join("\n");
+
+        let actual_selections = self.editor_selections();
+        let actual_marked_text =
+            generate_marked_text(&self.buffer_text(), &actual_selections, true);
+
+        // Read the actual diff from the editor's row highlights and block
+        // decorations.
+        let actual_diff = self.editor.update(&mut self.cx, |editor, cx| {
+            let snapshot = editor.snapshot(cx);
+            let insertions = editor
+                .highlighted_rows::<DiffRowHighlight>()
+                .map(|(range, _)| {
+                    let start = range.start.to_point(&snapshot.buffer_snapshot);
+                    let end = range.end.to_point(&snapshot.buffer_snapshot);
+                    start.row..end.row
+                })
+                .collect::<Vec<_>>();
+            let deletions = editor
+                .diff_map
+                .hunks
+                .iter()
+                .filter_map(|hunk| {
+                    if hunk.blocks.is_empty() {
+                        return None;
+                    }
+                    let row = hunk
+                        .hunk_range
+                        .start
+                        .to_point(&snapshot.buffer_snapshot)
+                        .row;
+                    let (_, buffer, _) = editor
+                        .buffer()
+                        .read(cx)
+                        .excerpt_containing(hunk.hunk_range.start, cx)
+                        .expect("no excerpt for expanded buffer's hunk start");
+                    let buffer_id = buffer.read(cx).remote_id();
+                    let change_set = &editor
+                        .diff_map
+                        .diff_bases
+                        .get(&buffer_id)
+                        .expect("should have a diff base for expanded hunk")
+                        .change_set;
+                    let deleted_text = change_set
+                        .read(cx)
+                        .base_text
+                        .as_ref()
+                        .expect("no base text for expanded hunk")
+                        .read(cx)
+                        .as_rope()
+                        .slice(hunk.diff_base_byte_range.clone())
+                        .to_string();
+                    if let DiffHunkStatus::Modified | DiffHunkStatus::Removed = hunk.status {
+                        Some((row, deleted_text))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            format_diff(actual_marked_text, deletions, insertions)
+        });
+
+        pretty_assertions::assert_eq!(actual_diff, expected_diff_text, "unexpected diff state");
+    }
+
     /// Make an assertion about the editor's text and the ranges and directions
     /// of its selections using a string containing embedded range markers.
     ///
     /// See the `util::test::marked_text_ranges` function for more information.
     #[track_caller]
     pub fn assert_editor_state(&mut self, marked_text: &str) {
-        let (unmarked_text, expected_selections) = marked_text_ranges(marked_text, true);
-        let buffer_text = self.buffer_text();
-
-        if buffer_text != unmarked_text {
-            panic!("Unmarked text doesn't match buffer text\nBuffer text: {buffer_text:?}\nUnmarked text: {unmarked_text:?}\nRaw buffer text\n{buffer_text}\nRaw unmarked text\n{unmarked_text}");
-        }
-
+        let (expected_text, expected_selections) = marked_text_ranges(marked_text, true);
+        pretty_assertions::assert_eq!(self.buffer_text(), expected_text, "unexpected buffer text");
         self.assert_selections(expected_selections, marked_text.to_string())
     }
 
@@ -327,8 +438,8 @@ impl EditorTestContext {
                 .background_highlights
                 .get(&TypeId::of::<Tag>())
                 .map(|h| h.1.clone())
-                .unwrap_or_else(|| Arc::default())
-                .into_iter()
+                .unwrap_or_default()
+                .iter()
                 .map(|range| range.to_offset(&snapshot.buffer_snapshot))
                 .collect()
         });
@@ -383,23 +494,54 @@ impl EditorTestContext {
         let actual_marked_text =
             generate_marked_text(&self.buffer_text(), &actual_selections, true);
         if expected_selections != actual_selections {
-            panic!(
-                indoc! {"
-
-                {}Editor has unexpected selections.
-
-                Expected selections:
-                {}
-
-                Actual selections:
-                {}
-            "},
-                self.assertion_context(),
-                expected_marked_text,
+            pretty_assertions::assert_eq!(
                 actual_marked_text,
+                expected_marked_text,
+                "{}Editor has unexpected selections",
+                self.assertion_context(),
             );
         }
     }
+}
+
+fn format_diff(
+    text: String,
+    actual_deletions: Vec<(u32, String)>,
+    actual_insertions: Vec<Range<u32>>,
+) -> String {
+    let mut diff = String::new();
+    for (row, line) in text.split('\n').enumerate() {
+        let row = row as u32;
+        if row > 0 {
+            diff.push('\n');
+        }
+        if let Some(text) = actual_deletions
+            .iter()
+            .find_map(|(deletion_row, deleted_text)| {
+                if *deletion_row == row {
+                    Some(deleted_text)
+                } else {
+                    None
+                }
+            })
+        {
+            for line in text.lines() {
+                diff.push('-');
+                if !line.is_empty() {
+                    diff.push(' ');
+                    diff.push_str(line);
+                }
+                diff.push('\n');
+            }
+        }
+        let marker = if actual_insertions.iter().any(|range| range.contains(&row)) {
+            "+ "
+        } else {
+            "  "
+        };
+        diff.push_str(format!("{marker}{line}").trim_end());
+    }
+    diff
 }
 
 impl Deref for EditorTestContext {
@@ -422,6 +564,12 @@ impl DerefMut for EditorTestContext {
 pub struct AssertionContextManager {
     id: Arc<AtomicUsize>,
     contexts: Arc<RwLock<BTreeMap<usize, String>>>,
+}
+
+impl Default for AssertionContextManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AssertionContextManager {

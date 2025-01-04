@@ -10,7 +10,7 @@ use language::language_settings::{AllLanguageSettings, SoftWrap};
 use util::test::marked_text_offsets;
 
 use super::{neovim_connection::NeovimConnection, VimTestContext};
-use crate::{state::Mode, Vim};
+use crate::state::{Mode, VimGlobals};
 
 pub struct NeovimBackedTestContext {
     cx: VimTestContext,
@@ -162,6 +162,30 @@ impl NeovimBackedTestContext {
         }
     }
 
+    pub async fn new_html(cx: &mut gpui::TestAppContext) -> NeovimBackedTestContext {
+        #[cfg(feature = "neovim")]
+        cx.executor().allow_parking();
+        // rust stores the name of the test on the current thread.
+        // We use this to automatically name a file that will store
+        // the neovim connection's requests/responses so that we can
+        // run without neovim on CI.
+        let thread = thread::current();
+        let test_name = thread
+            .name()
+            .expect("thread is not named")
+            .split(':')
+            .last()
+            .unwrap()
+            .to_string();
+        Self {
+            cx: VimTestContext::new_html(cx).await,
+            neovim: NeovimConnection::new(test_name).await,
+
+            last_set_state: None,
+            recent_keystrokes: Default::default(),
+        }
+    }
+
     pub async fn set_shared_state(&mut self, marked_text: &str) {
         let mode = if marked_text.contains('»') {
             Mode::Visual
@@ -247,7 +271,12 @@ impl NeovimBackedTestContext {
             register: '"',
             state: self.shared_state().await,
             neovim: self.neovim.read_register('"').await,
-            editor: self.read_from_clipboard().unwrap().text().clone(),
+            editor: self
+                .read_from_clipboard()
+                .unwrap()
+                .text()
+                .unwrap()
+                .to_owned(),
         }
     }
 
@@ -258,8 +287,7 @@ impl NeovimBackedTestContext {
             state: self.shared_state().await,
             neovim: self.neovim.read_register(register).await,
             editor: self.update(|cx| {
-                Vim::read(cx)
-                    .workspace_state
+                cx.global::<VimGlobals>()
                     .registers
                     .get(&register)
                     .cloned()

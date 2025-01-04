@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::{ops::Range, path::Path};
 use text::Rope;
@@ -32,7 +32,7 @@ impl Blame {
         remote_url: Option<String>,
         provider_registry: Arc<GitHostingProviderRegistry>,
     ) -> Result<Self> {
-        let output = run_git_blame(git_binary, working_directory, path, &content)?;
+        let output = run_git_blame(git_binary, working_directory, path, content)?;
         let mut entries = parse_git_blame(&output)?;
         entries.sort_unstable_by(|a, b| a.range.start.cmp(&b.range.start));
 
@@ -60,7 +60,7 @@ impl Blame {
 
         let shas = unique_shas.into_iter().collect::<Vec<_>>();
         let messages =
-            get_messages(&working_directory, &shas).context("failed to get commit messages")?;
+            get_messages(working_directory, &shas).context("failed to get commit messages")?;
 
         Ok(Self {
             entries,
@@ -71,8 +71,8 @@ impl Blame {
     }
 }
 
-const GIT_BLAME_NO_COMMIT_ERROR: &'static str = "fatal: no such ref: HEAD";
-const GIT_BLAME_NO_PATH: &'static str = "fatal: no such path";
+const GIT_BLAME_NO_COMMIT_ERROR: &str = "fatal: no such ref: HEAD";
+const GIT_BLAME_NO_PATH: &str = "fatal: no such path";
 
 fn run_git_blame(
     git_binary: &Path,
@@ -80,9 +80,7 @@ fn run_git_blame(
     path: &Path,
     contents: &Rope,
 ) -> Result<String> {
-    let mut child = Command::new(git_binary);
-
-    child
+    let child = util::command::new_std_command(git_binary)
         .current_dir(working_directory)
         .arg("blame")
         .arg("--incremental")
@@ -91,15 +89,7 @@ fn run_git_blame(
         .arg(path.as_os_str())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        child.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
-    }
-
-    let child = child
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| anyhow!("Failed to start git blame process: {}", e))?;
 

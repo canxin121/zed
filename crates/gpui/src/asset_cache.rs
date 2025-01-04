@@ -1,32 +1,43 @@
-use crate::{SharedUri, WindowContext};
-use collections::FxHashMap;
+use crate::{AppContext, SharedString, SharedUri};
 use futures::Future;
-use parking_lot::Mutex;
-use std::any::TypeId;
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
-use std::{any::Any, path::PathBuf};
 
+use std::fmt::Debug;
+use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// An enum representing
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub(crate) enum UriOrPath {
+pub enum Resource {
+    /// This resource is at a given URI
     Uri(SharedUri),
-    Path(Arc<PathBuf>),
+    /// This resource is at a given path in the file system
+    Path(Arc<Path>),
+    /// This resource is embedded in the application binary
+    Embedded(SharedString),
 }
 
-impl From<SharedUri> for UriOrPath {
+impl From<SharedUri> for Resource {
     fn from(value: SharedUri) -> Self {
         Self::Uri(value)
     }
 }
 
-impl From<Arc<PathBuf>> for UriOrPath {
-    fn from(value: Arc<PathBuf>) -> Self {
+impl From<PathBuf> for Resource {
+    fn from(value: PathBuf) -> Self {
+        Self::Path(value.into())
+    }
+}
+
+impl From<Arc<Path>> for Resource {
+    fn from(value: Arc<Path>) -> Self {
         Self::Path(value)
     }
 }
 
 /// A trait for asynchronous asset loading.
-pub trait Asset {
+pub trait Asset: 'static {
     /// The source of the asset.
     type Source: Clone + Hash + Send;
 
@@ -36,8 +47,33 @@ pub trait Asset {
     /// Load the asset asynchronously
     fn load(
         source: Self::Source,
-        cx: &mut WindowContext,
+        cx: &mut AppContext,
     ) -> impl Future<Output = Self::Output> + Send + 'static;
+}
+
+/// An asset Loader that logs whatever passes through it
+pub enum AssetLogger<T> {
+    #[doc(hidden)]
+    _Phantom(PhantomData<T>, &'static dyn crate::seal::Sealed),
+}
+
+impl<R: Clone + Send, E: Clone + Send + std::error::Error, T: Asset<Output = Result<R, E>>> Asset
+    for AssetLogger<T>
+{
+    type Source = T::Source;
+
+    type Output = T::Output;
+
+    fn load(
+        source: Self::Source,
+        cx: &mut AppContext,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        let load = T::load(source, cx);
+        async {
+            load.await
+                .inspect_err(|e| log::error!("Failed to load asset: {}", e))
+        }
+    }
 }
 
 /// Use a quick, non-cryptographically secure hash function to get an identifier from data
@@ -45,43 +81,4 @@ pub fn hash<T: Hash>(data: &T) -> u64 {
     let mut hasher = collections::FxHasher::default();
     data.hash(&mut hasher);
     hasher.finish()
-}
-
-/// A cache for assets.
-#[derive(Clone)]
-pub struct AssetCache {
-    assets: Arc<Mutex<FxHashMap<(TypeId, u64), Box<dyn Any + Send>>>>,
-}
-
-impl AssetCache {
-    pub(crate) fn new() -> Self {
-        Self {
-            assets: Default::default(),
-        }
-    }
-
-    /// Get the asset from the cache, if it exists.
-    pub fn get<A: Asset + 'static>(&self, source: &A::Source) -> Option<A::Output> {
-        self.assets
-            .lock()
-            .get(&(TypeId::of::<A>(), hash(&source)))
-            .and_then(|task| task.downcast_ref::<A::Output>())
-            .cloned()
-    }
-
-    /// Insert the asset into the cache.
-    pub fn insert<A: Asset + 'static>(&mut self, source: A::Source, output: A::Output) {
-        self.assets
-            .lock()
-            .insert((TypeId::of::<A>(), hash(&source)), Box::new(output));
-    }
-
-    /// Remove an entry from the asset cache
-    pub fn remove<A: Asset + 'static>(&mut self, source: &A::Source) -> Option<A::Output> {
-        self.assets
-            .lock()
-            .remove(&(TypeId::of::<A>(), hash(&source)))
-            .and_then(|any| any.downcast::<A::Output>().ok())
-            .map(|boxed| *boxed)
-    }
 }

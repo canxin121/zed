@@ -2,24 +2,23 @@
 
 #![deny(missing_docs)]
 
-use std::{env, str::FromStr};
+use std::{env, str::FromStr, sync::LazyLock};
 
 use gpui::{AppContext, Global, SemanticVersion};
-use once_cell::sync::Lazy;
 
 /// stable | dev | nightly | preview
-pub static RELEASE_CHANNEL_NAME: Lazy<String> = if cfg!(debug_assertions) {
-    Lazy::new(|| {
+pub static RELEASE_CHANNEL_NAME: LazyLock<String> = LazyLock::new(|| {
+    if cfg!(debug_assertions) {
         env::var("ZED_RELEASE_CHANNEL")
             .unwrap_or_else(|_| include_str!("../../zed/RELEASE_CHANNEL").trim().to_string())
-    })
-} else {
-    Lazy::new(|| include_str!("../../zed/RELEASE_CHANNEL").trim().to_string())
-};
+    } else {
+        include_str!("../../zed/RELEASE_CHANNEL").trim().to_string()
+    }
+});
 
 #[doc(hidden)]
-pub static RELEASE_CHANNEL: Lazy<ReleaseChannel> =
-    Lazy::new(|| match ReleaseChannel::from_str(&RELEASE_CHANNEL_NAME) {
+pub static RELEASE_CHANNEL: LazyLock<ReleaseChannel> =
+    LazyLock::new(|| match ReleaseChannel::from_str(&RELEASE_CHANNEL_NAME) {
         Ok(channel) => channel,
         _ => panic!("invalid release channel {}", *RELEASE_CHANNEL_NAME),
     });
@@ -120,10 +119,7 @@ impl ReleaseChannel {
 
     /// Returns whether we want to poll for updates for this [`ReleaseChannel`]
     pub fn poll_for_updates(&self) -> bool {
-        match self {
-            ReleaseChannel::Dev => false,
-            _ => true,
-        }
+        !matches!(self, ReleaseChannel::Dev)
     }
 
     /// Returns the display name for this [`ReleaseChannel`].

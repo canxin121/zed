@@ -5,14 +5,72 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use editor::Editor;
-use gpui::{prelude::*, AppContext, Entity, View, WeakView, WindowContext};
-use language::{BufferSnapshot, Language, Point};
+use gpui::{prelude::*, Entity, View, WeakView, WindowContext};
+use language::{BufferSnapshot, Language, LanguageName, Point};
+use project::{ProjectItem as _, WorktreeId};
 
 use crate::repl_store::ReplStore;
 use crate::session::SessionEvent;
-use crate::{KernelSpecification, Session};
+use crate::{
+    ClearOutputs, Interrupt, JupyterSettings, KernelSpecification, Restart, Session, Shutdown,
+};
 
-pub fn run(editor: WeakView<Editor>, cx: &mut WindowContext) -> Result<()> {
+pub fn assign_kernelspec(
+    kernel_specification: KernelSpecification,
+    weak_editor: WeakView<Editor>,
+    cx: &mut WindowContext,
+) -> Result<()> {
+    let store = ReplStore::global(cx);
+    if !store.read(cx).is_enabled() {
+        return Ok(());
+    }
+
+    let worktree_id = crate::repl_editor::worktree_id_for_editor(weak_editor.clone(), cx)
+        .context("editor is not in a worktree")?;
+
+    store.update(cx, |store, cx| {
+        store.set_active_kernelspec(worktree_id, kernel_specification.clone(), cx);
+    });
+
+    let fs = store.read(cx).fs().clone();
+
+    if let Some(session) = store.read(cx).get_session(weak_editor.entity_id()).cloned() {
+        // Drop previous session, start new one
+        session.update(cx, |session, cx| {
+            session.clear_outputs(cx);
+            session.shutdown(cx);
+            cx.notify();
+        });
+    }
+
+    let session = cx.new_view(|cx| Session::new(weak_editor.clone(), fs, kernel_specification, cx));
+
+    weak_editor
+        .update(cx, |_editor, cx| {
+            cx.notify();
+
+            cx.subscribe(&session, {
+                let store = store.clone();
+                move |_this, _session, event, cx| match event {
+                    SessionEvent::Shutdown(shutdown_event) => {
+                        store.update(cx, |store, _cx| {
+                            store.remove_session(shutdown_event.entity_id());
+                        });
+                    }
+                }
+            })
+            .detach();
+        })
+        .ok();
+
+    store.update(cx, |store, _cx| {
+        store.insert_session(weak_editor.entity_id(), session.clone());
+    });
+
+    Ok(())
+}
+
+pub fn run(editor: WeakView<Editor>, move_down: bool, cx: &mut WindowContext) -> Result<()> {
     let store = ReplStore::global(cx);
     if !store.read(cx).is_enabled() {
         return Ok(());
@@ -27,6 +85,10 @@ pub fn run(editor: WeakView<Editor>, cx: &mut WindowContext) -> Result<()> {
         return Ok(());
     };
 
+    let Some(project_path) = buffer.read(cx).project_path(cx) else {
+        return Ok(());
+    };
+
     let (runnable_ranges, next_cell_point) =
         runnable_ranges(&buffer.read(cx).snapshot(), selected_range);
 
@@ -35,22 +97,19 @@ pub fn run(editor: WeakView<Editor>, cx: &mut WindowContext) -> Result<()> {
             continue;
         };
 
-        let kernel_specification = store.update(cx, |store, cx| {
-            store
-                .kernelspec(&language, cx)
-                .with_context(|| format!("No kernel found for language: {}", language.name()))
-        })?;
+        let kernel_specification = store
+            .read(cx)
+            .active_kernelspec(project_path.worktree_id, Some(language.clone()), cx)
+            .ok_or_else(|| anyhow::anyhow!("No kernel found for language: {}", language.name()))?;
 
         let fs = store.read(cx).fs().clone();
-        let telemetry = store.read(cx).telemetry().clone();
 
         let session = if let Some(session) = store.read(cx).get_session(editor.entity_id()).cloned()
         {
             session
         } else {
             let weak_editor = editor.downgrade();
-            let session = cx
-                .new_view(|cx| Session::new(weak_editor, fs, telemetry, kernel_specification, cx));
+            let session = cx.new_view(|cx| Session::new(weak_editor, fs, kernel_specification, cx));
 
             editor.update(cx, |_editor, cx| {
                 cx.notify();
@@ -89,21 +148,38 @@ pub fn run(editor: WeakView<Editor>, cx: &mut WindowContext) -> Result<()> {
         }
 
         session.update(cx, |session, cx| {
-            session.execute(selected_text, anchor_range, next_cursor, cx);
+            session.execute(selected_text, anchor_range, next_cursor, move_down, cx);
         });
     }
 
     anyhow::Ok(())
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum SessionSupport {
     ActiveSession(View<Session>),
-    Inactive(Box<KernelSpecification>),
-    RequiresSetup(Arc<str>),
+    Inactive(KernelSpecification),
+    RequiresSetup(LanguageName),
     Unsupported,
 }
 
-pub fn session(editor: WeakView<Editor>, cx: &mut AppContext) -> SessionSupport {
+pub fn worktree_id_for_editor(
+    editor: WeakView<Editor>,
+    cx: &mut WindowContext,
+) -> Option<WorktreeId> {
+    editor.upgrade().and_then(|editor| {
+        editor
+            .read(cx)
+            .buffer()
+            .read(cx)
+            .as_singleton()?
+            .read(cx)
+            .project_path(cx)
+            .map(|path| path.worktree_id)
+    })
+}
+
+pub fn session(editor: WeakView<Editor>, cx: &mut WindowContext) -> SessionSupport {
     let store = ReplStore::global(cx);
     let entity_id = editor.entity_id();
 
@@ -111,15 +187,24 @@ pub fn session(editor: WeakView<Editor>, cx: &mut AppContext) -> SessionSupport 
         return SessionSupport::ActiveSession(session);
     };
 
-    let Some(language) = get_language(editor, cx) else {
+    let Some(language) = get_language(editor.clone(), cx) else {
         return SessionSupport::Unsupported;
     };
-    let kernelspec = store.update(cx, |store, cx| store.kernelspec(&language, cx));
+
+    let worktree_id = worktree_id_for_editor(editor.clone(), cx);
+
+    let Some(worktree_id) = worktree_id else {
+        return SessionSupport::Unsupported;
+    };
+
+    let kernelspec = store
+        .read(cx)
+        .active_kernelspec(worktree_id, Some(language.clone()), cx);
 
     match kernelspec {
-        Some(kernelspec) => SessionSupport::Inactive(Box::new(kernelspec)),
+        Some(kernelspec) => SessionSupport::Inactive(kernelspec),
         None => {
-            if language_supported(&language) {
+            if language_supported(&language.clone()) {
                 SessionSupport::RequiresSetup(language.name())
             } else {
                 SessionSupport::Unsupported
@@ -164,6 +249,81 @@ pub fn shutdown(editor: WeakView<Editor>, cx: &mut WindowContext) {
         session.shutdown(cx);
         cx.notify();
     });
+}
+
+pub fn restart(editor: WeakView<Editor>, cx: &mut WindowContext) {
+    let Some(editor) = editor.upgrade() else {
+        return;
+    };
+
+    let entity_id = editor.entity_id();
+
+    let Some(session) = ReplStore::global(cx)
+        .read(cx)
+        .get_session(entity_id)
+        .cloned()
+    else {
+        return;
+    };
+
+    session.update(cx, |session, cx| {
+        session.restart(cx);
+        cx.notify();
+    });
+}
+
+pub fn setup_editor_session_actions(editor: &mut Editor, editor_handle: WeakView<Editor>) {
+    editor
+        .register_action({
+            let editor_handle = editor_handle.clone();
+            move |_: &ClearOutputs, cx| {
+                if !JupyterSettings::enabled(cx) {
+                    return;
+                }
+
+                crate::clear_outputs(editor_handle.clone(), cx);
+            }
+        })
+        .detach();
+
+    editor
+        .register_action({
+            let editor_handle = editor_handle.clone();
+            move |_: &Interrupt, cx| {
+                if !JupyterSettings::enabled(cx) {
+                    return;
+                }
+
+                crate::interrupt(editor_handle.clone(), cx);
+            }
+        })
+        .detach();
+
+    editor
+        .register_action({
+            let editor_handle = editor_handle.clone();
+            move |_: &Shutdown, cx| {
+                if !JupyterSettings::enabled(cx) {
+                    return;
+                }
+
+                crate::shutdown(editor_handle.clone(), cx);
+            }
+        })
+        .detach();
+
+    editor
+        .register_action({
+            let editor_handle = editor_handle.clone();
+            move |_: &Restart, cx| {
+                if !JupyterSettings::enabled(cx) {
+                    return;
+                }
+
+                crate::restart(editor_handle.clone(), cx);
+            }
+        })
+        .detach();
 }
 
 fn cell_range(buffer: &BufferSnapshot, start_row: u32, end_row: u32) -> Range<Point> {
@@ -245,7 +405,7 @@ fn runnable_ranges(
     range: Range<Point>,
 ) -> (Vec<Range<Point>>, Option<Point>) {
     if let Some(language) = buffer.language() {
-        if language.name().as_ref() == "Markdown" {
+        if language.name() == "Markdown".into() {
             return (markdown_code_blocks(buffer, range.clone()), None);
         }
     }
@@ -282,23 +442,27 @@ fn markdown_code_blocks(buffer: &BufferSnapshot, range: Range<Point>) -> Vec<Ran
 }
 
 fn language_supported(language: &Arc<Language>) -> bool {
-    match language.name().as_ref() {
+    match language.name().0.as_ref() {
         "TypeScript" | "Python" => true,
         _ => false,
     }
 }
 
-fn get_language(editor: WeakView<Editor>, cx: &mut AppContext) -> Option<Arc<Language>> {
-    let editor = editor.upgrade()?;
-    let selection = editor.read(cx).selections.newest::<usize>(cx);
-    let buffer = editor.read(cx).buffer().read(cx).snapshot(cx);
-    buffer.language_at(selection.head()).cloned()
+fn get_language(editor: WeakView<Editor>, cx: &mut WindowContext) -> Option<Arc<Language>> {
+    editor
+        .update(cx, |editor, cx| {
+            let selection = editor.selections.newest::<usize>(cx);
+            let buffer = editor.buffer().read(cx).snapshot(cx);
+            buffer.language_at(selection.head()).cloned()
+        })
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Context, Task};
+    use gpui::{AppContext, Context};
     use indoc::indoc;
     use language::{Buffer, Language, LanguageConfig, LanguageRegistry};
 
@@ -448,14 +612,13 @@ mod tests {
 
     #[gpui::test]
     fn test_markdown_code_blocks(cx: &mut AppContext) {
-        let markdown = languages::language("markdown", tree_sitter_md::language());
-        let typescript =
-            languages::language("typescript", tree_sitter_typescript::language_typescript());
-        let python = languages::language("python", tree_sitter_python::language());
-        let language_registry = Arc::new(LanguageRegistry::new(
-            Task::ready(()),
-            cx.background_executor().clone(),
-        ));
+        let markdown = languages::language("markdown", tree_sitter_md::LANGUAGE.into());
+        let typescript = languages::language(
+            "typescript",
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        );
+        let python = languages::language("python", tree_sitter_python::LANGUAGE.into());
+        let language_registry = Arc::new(LanguageRegistry::new(cx.background_executor().clone()));
         language_registry.add(markdown.clone());
         language_registry.add(typescript.clone());
         language_registry.add(python.clone());

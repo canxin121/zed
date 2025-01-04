@@ -5,9 +5,9 @@ use crate::lsp_log::LogMenuItem;
 use super::*;
 use futures::StreamExt;
 use gpui::{Context, SemanticVersion, TestAppContext, VisualTestContext};
-use language::{
-    tree_sitter_rust, FakeLspAdapter, Language, LanguageConfig, LanguageMatcher, LanguageServerName,
-};
+use language::{tree_sitter_rust, FakeLspAdapter, Language, LanguageConfig, LanguageMatcher};
+use lsp::LanguageServerName;
+use lsp_log::LogKind;
 use project::{FakeFs, Project};
 use serde_json::json;
 use settings::SettingsStore;
@@ -42,9 +42,9 @@ async fn test_lsp_logs(cx: &mut TestAppContext) {
             },
             ..Default::default()
         },
-        Some(tree_sitter_rust::language()),
+        Some(tree_sitter_rust::LANGUAGE.into()),
     )));
-    let mut fake_rust_servers = language_registry.register_fake_lsp_adapter(
+    let mut fake_rust_servers = language_registry.register_fake_lsp(
         "Rust",
         FakeLspAdapter {
             name: "the-rust-language-server",
@@ -52,12 +52,12 @@ async fn test_lsp_logs(cx: &mut TestAppContext) {
         },
     );
 
-    let log_store = cx.new_model(|cx| LogStore::new(cx));
+    let log_store = cx.new_model(LogStore::new);
     log_store.update(cx, |store, cx| store.add_project(&project, cx));
 
     let _rust_buffer = project
         .update(cx, |project, cx| {
-            project.open_local_buffer("/the-root/test.rs", cx)
+            project.open_local_buffer_with_lsp("/the-root/test.rs", cx)
         })
         .await
         .unwrap();
@@ -92,8 +92,11 @@ async fn test_lsp_logs(cx: &mut TestAppContext) {
                     .root_name()
                     .to_string(),
                 rpc_trace_enabled: false,
-                rpc_trace_selected: false,
-                logs_selected: true,
+                selected_entry: LogKind::Logs,
+                trace_level: lsp::TraceValue::Off,
+                server_kind: lsp_log::LanguageServerKind::Local {
+                    project: project.downgrade()
+                }
             }]
         );
         assert_eq!(view.editor.read(cx).text(cx), "hello from the server\n");

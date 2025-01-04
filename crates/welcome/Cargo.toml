@@ -17,9 +17,8 @@ test-support = []
 [dependencies]
 anyhow.workspace = true
 client.workspace = true
-inline_completion_button.workspace = true
+copilot.workspace = true
 db.workspace = true
-extensions_ui.workspace = true
 fuzzy.workspace = true
 gpui.workspace = true
 install_cli.workspace = true
@@ -28,11 +27,12 @@ project.workspace = true
 schemars.workspace = true
 serde.workspace = true
 settings.workspace = true
-theme_selector.workspace = true
 ui.workspace = true
+telemetry.workspace = true
 util.workspace = true
-vim.workspace = true
+vim_mode_setting.workspace = true
 workspace.workspace = true
+zed_actions.workspace = true
 
 [dev-dependencies]
 editor = { workspace = true, features = ["test-support"] }

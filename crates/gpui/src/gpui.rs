@@ -56,7 +56,7 @@
 //!   and [`test`] modules for more details.
 //!
 //! Currently, the best way to learn about these APIs is to read the Zed source code, ask us about it at a fireside hack, or drop
-//! a question in the [Zed Discord](https://discord.gg/U4qhCEhMXP). We're working on improving the documentation, creating more examples,
+//! a question in the [Zed Discord](https://zed.dev/community-links). We're working on improving the documentation, creating more examples,
 //! and will be publishing more guides to GPUI on our [blog](https://zed.dev/blog).
 
 #![deny(missing_docs)]
@@ -128,6 +128,7 @@ pub use executor::*;
 pub use geometry::*;
 pub use global::*;
 pub use gpui_macros::{register_action, test, IntoElement, Render};
+pub use http_client;
 pub use input::*;
 pub use interactive::*;
 use key_dispatch::*;
@@ -201,7 +202,7 @@ pub trait Context {
     /// Update a window for the given handle.
     fn update_window<T, F>(&mut self, window: AnyWindowHandle, f: F) -> Result<T>
     where
-        F: FnOnce(AnyView, &mut WindowContext<'_>) -> T;
+        F: FnOnce(AnyView, &mut WindowContext) -> T;
 
     /// Read a window off of the application context.
     fn read_window<T, R>(
@@ -230,7 +231,7 @@ pub trait VisualContext: Context {
     /// Construct a new view in the window referenced by this context.
     fn new_view<V>(
         &mut self,
-        build_view: impl FnOnce(&mut ViewContext<'_, V>) -> V,
+        build_view: impl FnOnce(&mut ViewContext<V>) -> V,
     ) -> Self::Result<View<V>>
     where
         V: 'static + Render;
@@ -239,13 +240,13 @@ pub trait VisualContext: Context {
     fn update_view<V: 'static, R>(
         &mut self,
         view: &View<V>,
-        update: impl FnOnce(&mut V, &mut ViewContext<'_, V>) -> R,
+        update: impl FnOnce(&mut V, &mut ViewContext<V>) -> R,
     ) -> Self::Result<R>;
 
     /// Replace the root view of a window with a new view.
     fn replace_root_view<V>(
         &mut self,
-        build_view: impl FnOnce(&mut ViewContext<'_, V>) -> V,
+        build_view: impl FnOnce(&mut ViewContext<V>) -> V,
     ) -> Self::Result<View<V>>
     where
         V: 'static + Render;
@@ -305,6 +306,7 @@ where
         self.borrow_mut().set_global(global)
     }
 
+    #[track_caller]
     fn update_global<G, R>(&mut self, f: impl FnOnce(&mut G, &mut Self) -> R) -> R
     where
         G: Global,
@@ -342,15 +344,15 @@ impl<T> Flatten<T> for Result<T> {
     }
 }
 
+/// Information about the GPU GPUI is running on.
 #[derive(Default, Debug)]
-/// Information about the GPU GPUI is running on
-pub struct GPUSpecs {
-    /// true if the GPU is really a fake (like llvmpipe) running on the CPU
+pub struct GpuSpecs {
+    /// Whether the GPU is really a fake (like `llvmpipe`) running on the CPU.
     pub is_software_emulated: bool,
-    /// Name of the device as reported by vulkan
+    /// The name of the device, as reported by Vulkan.
     pub device_name: String,
-    /// Name of the driver as reported by vulkan
+    /// The name of the driver, as reported by Vulkan.
     pub driver_name: String,
-    /// Further driver info as reported by vulkan
+    /// Further information about the driver, as reported by Vulkan.
     pub driver_info: String,
 }

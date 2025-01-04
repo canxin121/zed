@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
-use language::{LanguageServerName, LspAdapter, LspAdapterDelegate};
-use lsp::LanguageServerBinary;
+use language::{LspAdapter, LspAdapterDelegate};
+use lsp::{LanguageServerBinary, LanguageServerName};
 use node_runtime::NodeRuntime;
 use serde_json::json;
 use smol::fs;
@@ -22,11 +22,12 @@ fn server_binary_arguments(server_path: &Path) -> Vec<OsString> {
 }
 
 pub struct CssLspAdapter {
-    node: Arc<dyn NodeRuntime>,
+    node: NodeRuntime,
 }
 
 impl CssLspAdapter {
-    pub fn new(node: Arc<dyn NodeRuntime>) -> Self {
+    const PACKAGE_NAME: &str = "vscode-langservers-extracted";
+    pub fn new(node: NodeRuntime) -> Self {
         CssLspAdapter { node }
     }
 }
@@ -56,18 +57,13 @@ impl LspAdapter for CssLspAdapter {
     ) -> Result<LanguageServerBinary> {
         let latest_version = latest_version.downcast::<String>().unwrap();
         let server_path = container_dir.join(SERVER_PATH);
-        let package_name = "vscode-langservers-extracted";
 
-        let should_install_language_server = self
-            .node
-            .should_install_npm_package(package_name, &server_path, &container_dir, &latest_version)
-            .await;
-
-        if should_install_language_server {
-            self.node
-                .npm_install_packages(&container_dir, &[(package_name, latest_version.as_str())])
-                .await?;
-        }
+        self.node
+            .npm_install_packages(
+                &container_dir,
+                &[(Self::PACKAGE_NAME, latest_version.as_str())],
+            )
+            .await?;
 
         Ok(LanguageServerBinary {
             path: self.node.binary_path().await?,
@@ -76,19 +72,37 @@ impl LspAdapter for CssLspAdapter {
         })
     }
 
+    async fn check_if_version_installed(
+        &self,
+        version: &(dyn 'static + Send + Any),
+        container_dir: &PathBuf,
+        _: &dyn LspAdapterDelegate,
+    ) -> Option<LanguageServerBinary> {
+        let version = version.downcast_ref::<String>().unwrap();
+        let server_path = container_dir.join(SERVER_PATH);
+
+        let should_install_language_server = self
+            .node
+            .should_install_npm_package(Self::PACKAGE_NAME, &server_path, &container_dir, &version)
+            .await;
+
+        if should_install_language_server {
+            None
+        } else {
+            Some(LanguageServerBinary {
+                path: self.node.binary_path().await.ok()?,
+                env: None,
+                arguments: server_binary_arguments(&server_path),
+            })
+        }
+    }
+
     async fn cached_server_binary(
         &self,
         container_dir: PathBuf,
         _: &dyn LspAdapterDelegate,
     ) -> Option<LanguageServerBinary> {
-        get_cached_server_binary(container_dir, &*self.node).await
-    }
-
-    async fn installation_test_binary(
-        &self,
-        container_dir: PathBuf,
-    ) -> Option<LanguageServerBinary> {
-        get_cached_server_binary(container_dir, &*self.node).await
+        get_cached_server_binary(container_dir, &self.node).await
     }
 
     async fn initialization_options(
@@ -103,7 +117,7 @@ impl LspAdapter for CssLspAdapter {
 
 async fn get_cached_server_binary(
     container_dir: PathBuf,
-    node: &dyn NodeRuntime,
+    node: &NodeRuntime,
 ) -> Option<LanguageServerBinary> {
     maybe!(async {
         let mut last_version_dir = None;
@@ -140,7 +154,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_outline(cx: &mut TestAppContext) {
-        let language = crate::language("css", tree_sitter_css::language());
+        let language = crate::language("css", tree_sitter_css::LANGUAGE.into());
 
         let text = r#"
             /* Import statement */

@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use db::kvp::KEY_VALUE_STORE;
 use editor::Editor;
-use extension::ExtensionStore;
+use extension_host::ExtensionStore;
 use gpui::{Model, VisualContext};
 use language::Buffer;
 use ui::{SharedString, ViewContext};
@@ -17,7 +17,9 @@ const SUGGESTIONS_BY_EXTENSION_ID: &[(&str, &[&str])] = &[
     ("astro", &["astro"]),
     ("beancount", &["beancount"]),
     ("clojure", &["bb", "clj", "cljc", "cljs", "edn"]),
+    ("neocmake", &["CMakeLists.txt", "cmake"]),
     ("csharp", &["cs"]),
+    ("cython", &["pyx", "pxd", "pxi"]),
     ("dart", &["dart"]),
     ("dockerfile", &["Dockerfile"]),
     ("elisp", &["el"]),
@@ -54,6 +56,7 @@ const SUGGESTIONS_BY_EXTENSION_ID: &[(&str, &[&str])] = &[
     ("ocaml", &["ml", "mli"]),
     ("php", &["php"]),
     ("prisma", &["prisma"]),
+    ("proto", &["proto"]),
     ("purescript", &["purs"]),
     ("r", &["r", "R"]),
     ("racket", &["rkt"]),
@@ -77,11 +80,11 @@ fn suggested_extensions() -> &'static HashMap<&'static str, Arc<str>> {
     static SUGGESTIONS_BY_PATH_SUFFIX: OnceLock<HashMap<&str, Arc<str>>> = OnceLock::new();
     SUGGESTIONS_BY_PATH_SUFFIX.get_or_init(|| {
         SUGGESTIONS_BY_EXTENSION_ID
-            .into_iter()
+            .iter()
             .flat_map(|(name, path_suffixes)| {
                 let name = Arc::<str>::from(*name);
                 path_suffixes
-                    .into_iter()
+                    .iter()
                     .map(move |suffix| (*suffix, name.clone()))
             })
             .collect()
@@ -162,7 +165,7 @@ pub(crate) fn suggest(buffer: Model<Buffer>, cx: &mut ViewContext<Workspace>) {
 
         struct ExtensionSuggestionNotification;
 
-        let notification_id = NotificationId::identified::<ExtensionSuggestionNotification>(
+        let notification_id = NotificationId::composite::<ExtensionSuggestionNotification>(
             SharedString::from(extension_id.clone()),
         );
 

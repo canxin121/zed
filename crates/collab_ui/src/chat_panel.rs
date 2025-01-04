@@ -1,4 +1,4 @@
-use crate::{collab_panel, ChatPanelSettings};
+use crate::{collab_panel, ChatPanelButton, ChatPanelSettings};
 use anyhow::Result;
 use call::{room, ActiveCall};
 use channel::{ChannelChat, ChannelChatEvent, ChannelMessage, ChannelMessageId, ChannelStore};
@@ -23,7 +23,7 @@ use std::{sync::Arc, time::Duration};
 use time::{OffsetDateTime, UtcOffset};
 use ui::{
     prelude::*, Avatar, Button, ContextMenu, IconButton, IconName, KeyBinding, Label, PopoverMenu,
-    TabBar, Tooltip,
+    Tab, TabBar, Tooltip,
 };
 use util::{ResultExt, TryFutureExt};
 use workspace::{
@@ -560,7 +560,7 @@ impl ChatPanel {
                 },
             )
             .child(
-                self.render_popover_buttons(&cx, message_id, can_delete_message, can_edit_message)
+                self.render_popover_buttons(cx, message_id, can_delete_message, can_edit_message)
                     .mt_neg_2p5(),
             )
     }
@@ -705,12 +705,12 @@ impl ChatPanel {
                 menu.entry(
                     "Copy message text",
                     None,
-                    cx.handler_for(&this, move |this, cx| {
+                    cx.handler_for(this, move |this, cx| {
                         if let Some(message) = this.active_chat().and_then(|active_chat| {
                             active_chat.read(cx).find_loaded_message(message_id)
                         }) {
                             let text = message.body.clone();
-                            cx.write_to_clipboard(ClipboardItem::new(text))
+                            cx.write_to_clipboard(ClipboardItem::new_string(text))
                         }
                     }),
                 )
@@ -718,7 +718,7 @@ impl ChatPanel {
                     menu.entry(
                         "Delete message",
                         None,
-                        cx.handler_for(&this, move |this, cx| this.remove_message(message_id, cx)),
+                        cx.handler_for(this, move |this, cx| this.remove_message(message_id, cx)),
                     )
                 })
             })
@@ -802,13 +802,11 @@ impl ChatPanel {
                 {
                     task.detach();
                 }
-            } else {
-                if let Some(task) = chat
-                    .update(cx, |chat, cx| chat.send_message(message, cx))
-                    .log_err()
-                {
-                    task.detach();
-                }
+            } else if let Some(task) = chat
+                .update(cx, |chat, cx| chat.send_message(message, cx))
+                .log_err()
+            {
+                task.detach();
             }
         }
     }
@@ -854,7 +852,7 @@ impl ChatPanel {
             let scroll_to_message_id = this.update(&mut cx, |this, cx| {
                 this.set_active_chat(chat.clone(), cx);
 
-                scroll_to_message_id.or_else(|| this.last_acknowledged_message_id)
+                scroll_to_message_id.or(this.last_acknowledged_message_id)
             })?;
 
             if let Some(message_id) = scroll_to_message_id {
@@ -941,7 +939,7 @@ impl Render for ChatPanel {
                     TabBar::new("chat_header").child(
                         h_flex()
                             .w_full()
-                            .h(rems(ui::Tab::CONTAINER_HEIGHT_IN_REMS))
+                            .h(Tab::container_height(cx))
                             .px_2()
                             .child(Label::new(
                                 self.active_chat
@@ -1098,7 +1096,7 @@ impl FocusableView for ChatPanel {
 }
 
 impl Panel for ChatPanel {
-    fn position(&self, cx: &gpui::WindowContext) -> DockPosition {
+    fn position(&self, cx: &WindowContext) -> DockPosition {
         ChatPanelSettings::get_global(cx).dock
     }
 
@@ -1114,7 +1112,7 @@ impl Panel for ChatPanel {
         );
     }
 
-    fn size(&self, cx: &gpui::WindowContext) -> Pixels {
+    fn size(&self, cx: &WindowContext) -> Pixels {
         self.width
             .unwrap_or_else(|| ChatPanelSettings::get_global(cx).default_width)
     }
@@ -1137,7 +1135,20 @@ impl Panel for ChatPanel {
     }
 
     fn icon(&self, cx: &WindowContext) -> Option<ui::IconName> {
-        Some(ui::IconName::MessageBubbles).filter(|_| ChatPanelSettings::get_global(cx).button)
+        let show_icon = match ChatPanelSettings::get_global(cx).button {
+            ChatPanelButton::Never => false,
+            ChatPanelButton::Always => true,
+            ChatPanelButton::WhenInCall => {
+                let is_in_call = ActiveCall::global(cx)
+                    .read(cx)
+                    .room()
+                    .map_or(false, |room| room.read(cx).contains_guests());
+
+                self.active || is_in_call
+            }
+        };
+
+        show_icon.then(|| ui::IconName::MessageBubbles)
     }
 
     fn icon_tooltip(&self, _cx: &WindowContext) -> Option<&'static str> {
@@ -1153,6 +1164,10 @@ impl Panel for ChatPanel {
             .read(cx)
             .room()
             .is_some_and(|room| room.read(cx).contains_guests())
+    }
+
+    fn activation_priority(&self) -> u32 {
+        7
     }
 }
 

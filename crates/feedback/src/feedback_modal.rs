@@ -1,4 +1,8 @@
-use std::{ops::RangeInclusive, sync::Arc, time::Duration};
+use std::{
+    ops::RangeInclusive,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use anyhow::{anyhow, bail};
 use bitflags::bitflags;
@@ -11,17 +15,16 @@ use gpui::{
     PromptLevel, Render, Task, View, ViewContext,
 };
 use http_client::HttpClient;
-use isahc::Request;
 use language::Buffer;
 use project::Project;
 use regex::Regex;
 use serde_derive::Serialize;
 use ui::{prelude::*, Button, ButtonStyle, IconPosition, Tooltip};
 use util::ResultExt;
-use workspace::notifications::NotificationId;
-use workspace::{DismissDecision, ModalView, Toast, Workspace};
+use workspace::{DismissDecision, ModalView, Workspace};
+use zed_actions::feedback::GiveFeedback;
 
-use crate::{system_specs::SystemSpecs, GiveFeedback, OpenZedRepo};
+use crate::{system_specs::SystemSpecs, OpenZedRepo};
 
 // For UI testing purposes
 const SEND_SUCCESS_IN_DEV_MODE: bool = true;
@@ -35,7 +38,8 @@ const DEV_MODE: bool = true;
 const DEV_MODE: bool = false;
 
 const DATABASE_KEY_NAME: &str = "email_address";
-const EMAIL_REGEX: &str = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b";
+static EMAIL_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b").unwrap());
 const FEEDBACK_CHAR_LIMIT: RangeInclusive<i32> = 10..=5000;
 const FEEDBACK_SUBMISSION_ERROR_TEXT: &str =
     "Feedback failed to submit, see error log for details.";
@@ -44,8 +48,8 @@ const FEEDBACK_SUBMISSION_ERROR_TEXT: &str =
 struct FeedbackRequestBody<'a> {
     feedback_text: &'a str,
     email: Option<String>,
-    metrics_id: Option<Arc<str>>,
     installation_id: Option<Arc<str>>,
+    metrics_id: Option<Arc<str>>,
     system_specs: SystemSpecs,
     is_staff: bool,
 }
@@ -120,44 +124,34 @@ impl FeedbackModal {
     pub fn register(workspace: &mut Workspace, cx: &mut ViewContext<Workspace>) {
         let _handle = cx.view().downgrade();
         workspace.register_action(move |workspace, _: &GiveFeedback, cx| {
-            let markdown = workspace
-                .app_state()
-                .languages
-                .language_for_name("Markdown");
+            workspace
+                .with_local_workspace(cx, |workspace, cx| {
+                    let markdown = workspace
+                        .app_state()
+                        .languages
+                        .language_for_name("Markdown");
 
-            let project = workspace.project().clone();
-            let is_local_project = project.read(cx).is_local();
+                    let project = workspace.project().clone();
 
-            if !is_local_project {
-                struct FeedbackInRemoteProject;
+                    let system_specs = SystemSpecs::new(cx);
+                    cx.spawn(|workspace, mut cx| async move {
+                        let markdown = markdown.await.log_err();
+                        let buffer = project.update(&mut cx, |project, cx| {
+                            project.create_local_buffer("", markdown, cx)
+                        })?;
+                        let system_specs = system_specs.await;
 
-                workspace.show_toast(
-                    Toast::new(
-                        NotificationId::unique::<FeedbackInRemoteProject>(),
-                        "You can only submit feedback in your own project.",
-                    ),
-                    cx,
-                );
-                return;
-            }
+                        workspace.update(&mut cx, |workspace, cx| {
+                            workspace.toggle_modal(cx, move |cx| {
+                                FeedbackModal::new(system_specs, project, buffer, cx)
+                            });
+                        })?;
 
-            let system_specs = SystemSpecs::new(cx);
-            cx.spawn(|workspace, mut cx| async move {
-                let markdown = markdown.await.log_err();
-                let buffer = project.update(&mut cx, |project, cx| {
-                    project.create_local_buffer("", markdown, cx)
-                })?;
-                let system_specs = system_specs.await;
-
-                workspace.update(&mut cx, |workspace, cx| {
-                    workspace.toggle_modal(cx, move |cx| {
-                        FeedbackModal::new(system_specs, project, buffer, cx)
-                    });
-                })?;
-
-                anyhow::Ok(())
-            })
-            .detach_and_log_err(cx);
+                        anyhow::Ok(())
+                    })
+                    .detach_and_log_err(cx);
+                })
+                .detach_and_log_err(cx);
         });
     }
 
@@ -186,7 +180,7 @@ impl FeedbackModal {
             );
             editor.set_show_gutter(false, cx);
             editor.set_show_indent_guides(false, cx);
-            editor.set_show_inline_completions(false);
+            editor.set_show_inline_completions(Some(false), cx);
             editor.set_vertical_scroll_margin(5, cx);
             editor.set_use_modal_editing(false);
             editor
@@ -296,21 +290,21 @@ impl FeedbackModal {
         }
 
         let telemetry = zed_client.telemetry();
-        let metrics_id = telemetry.metrics_id();
         let installation_id = telemetry.installation_id();
+        let metrics_id = telemetry.metrics_id();
         let is_staff = telemetry.is_staff();
         let http_client = zed_client.http_client();
         let feedback_endpoint = http_client.build_url("/api/feedback");
         let request = FeedbackRequestBody {
-            feedback_text: &feedback_text,
+            feedback_text,
             email,
-            metrics_id,
             installation_id,
+            metrics_id,
             system_specs,
             is_staff: is_staff.unwrap_or(false),
         };
         let json_bytes = serde_json::to_vec(&request)?;
-        let request = Request::post(feedback_endpoint)
+        let request = http_client::http::Request::post(feedback_endpoint)
             .header("content-type", "application/json")
             .body(json_bytes.into())?;
         let mut response = http_client.send(request).await?;
@@ -331,7 +325,7 @@ impl FeedbackModal {
         let mut invalid_state_flags = InvalidStateFlags::empty();
 
         let valid_email_address = match self.email_address_editor.read(cx).text_option(cx) {
-            Some(email_address) => Regex::new(EMAIL_REGEX).unwrap().is_match(&email_address),
+            Some(email_address) => EMAIL_REGEX.is_match(&email_address),
             None => true,
         };
 

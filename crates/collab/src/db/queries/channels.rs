@@ -154,9 +154,9 @@ impl Database {
             }
             let role = role.unwrap();
 
-            let live_kit_room = format!("channel-{}", nanoid::nanoid!(30));
+            let livekit_room = format!("channel-{}", nanoid::nanoid!(30));
             let room_id = self
-                .get_or_create_channel_room(channel_id, &live_kit_room, &tx)
+                .get_or_create_channel_room(channel_id, &livekit_room, &tx)
                 .await?;
 
             self.join_channel_room_internal(room_id, user_id, connection, role, &tx)
@@ -188,17 +188,16 @@ impl Database {
                             .anyhow())?;
                     }
                 }
-            } else if visibility == ChannelVisibility::Members {
-                if self
+            } else if visibility == ChannelVisibility::Members
+                && self
                     .get_channel_descendants_excluding_self([&channel], &tx)
                     .await?
                     .into_iter()
                     .any(|channel| channel.visibility == ChannelVisibility::Public)
-                {
-                    Err(ErrorCode::BadPublicNesting
-                        .with_tag("direction", "children")
-                        .anyhow())?;
-                }
+            {
+                Err(ErrorCode::BadPublicNesting
+                    .with_tag("direction", "children")
+                    .anyhow())?;
             }
 
             let mut model = channel.into_active_model();
@@ -308,7 +307,7 @@ impl Database {
 
     fn sanitize_channel_name(name: &str) -> Result<&str> {
         let new_name = name.trim().trim_start_matches('#');
-        if new_name == "" {
+        if new_name.is_empty() {
             Err(anyhow!("channel name can't be blank"))?;
         }
         Ok(new_name)
@@ -616,15 +615,10 @@ impl Database {
             .observed_channel_messages(&channel_ids, user_id, tx)
             .await?;
 
-        let hosted_projects = self
-            .get_hosted_projects(&channel_ids, &roles_by_channel_id, tx)
-            .await?;
-
         Ok(ChannelsForUser {
             channel_memberships,
             channels,
             invited_channels,
-            hosted_projects,
             channel_participants,
             latest_buffer_versions,
             latest_channel_messages,
@@ -902,7 +896,7 @@ impl Database {
     pub(crate) async fn get_or_create_channel_room(
         &self,
         channel_id: ChannelId,
-        live_kit_room: &str,
+        livekit_room: &str,
         tx: &DatabaseTransaction,
     ) -> Result<RoomId> {
         let room = room::Entity::find()
@@ -915,7 +909,7 @@ impl Database {
         } else {
             let result = room::Entity::insert(room::ActiveModel {
                 channel_id: ActiveValue::Set(Some(channel_id)),
-                live_kit_room: ActiveValue::Set(live_kit_room.to_string()),
+                live_kit_room: ActiveValue::Set(livekit_room.to_string()),
                 ..Default::default()
             })
             .exec(tx)
@@ -985,7 +979,7 @@ impl Database {
                 .all(&*tx)
                 .await?
                 .into_iter()
-                .map(|c| Channel::from_model(c))
+                .map(Channel::from_model)
                 .collect::<Vec<_>>();
 
             Ok((root_id, channels))

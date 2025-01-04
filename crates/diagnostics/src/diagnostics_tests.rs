@@ -60,13 +60,14 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
 
     let language_server_id = LanguageServerId(0);
     let project = Project::test(fs.clone(), ["/test".as_ref()], cx).await;
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
     let window = cx.add_window(|cx| Workspace::test_new(project.clone(), cx));
     let cx = &mut VisualTestContext::from_window(*window, cx);
     let workspace = window.root(cx).unwrap();
 
     // Create some diagnostics
-    project.update(cx, |project, cx| {
-        project
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store
             .update_diagnostic_entries(
                 language_server_id,
                 PathBuf::from("/test/main.rs"),
@@ -150,19 +151,26 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
 
     // Open the project diagnostics view while there are already diagnostics.
     let view = window.build_view(cx, |cx| {
-        ProjectDiagnosticsEditor::new_with_context(1, project.clone(), workspace.downgrade(), cx)
+        ProjectDiagnosticsEditor::new_with_context(
+            1,
+            true,
+            project.clone(),
+            workspace.downgrade(),
+            cx,
+        )
     });
     let editor = view.update(cx, |view, _| view.editor.clone());
 
-    view.next_notification(cx).await;
+    view.next_notification(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10), cx)
+        .await;
     assert_eq!(
         editor_blocks(&editor, cx),
         [
             (DisplayRow(0), FILE_HEADER.into()),
-            (DisplayRow(2), DIAGNOSTIC_HEADER.into()),
-            (DisplayRow(15), EXCERPT_HEADER.into()),
-            (DisplayRow(16), DIAGNOSTIC_HEADER.into()),
-            (DisplayRow(25), EXCERPT_HEADER.into()),
+            (DisplayRow(3), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(16), EXCERPT_HEADER.into()),
+            (DisplayRow(18), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(27), EXCERPT_HEADER.into()),
         ]
     );
     assert_eq!(
@@ -176,6 +184,7 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
             // diagnostic group 1
             "\n", // primary message
             "\n", // padding
+            "\n", // expand
             "    let x = vec![];\n",
             "    let y = vec![];\n",
             "\n", // supporting diagnostic
@@ -187,6 +196,7 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
             "    c(y);\n",
             "\n", // supporting diagnostic
             "    d(x);\n",
+            "\n", // expand
             "\n", // context ellipsis
             // diagnostic group 2
             "\n", // primary message
@@ -198,11 +208,13 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
             "    a(x);\n",
             "\n", // supporting diagnostic
             "    b(y);\n",
+            "\n", // expand
             "\n", // context ellipsis
             "    c(y);\n",
             "    d(x);\n",
             "\n", // supporting diagnostic
-            "}"
+            "}",
+            "\n", // expand
         )
     );
 
@@ -210,14 +222,14 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
     editor.update(cx, |editor, cx| {
         assert_eq!(
             editor.selections.display_ranges(cx),
-            [DisplayPoint::new(DisplayRow(12), 6)..DisplayPoint::new(DisplayRow(12), 6)]
+            [DisplayPoint::new(DisplayRow(13), 6)..DisplayPoint::new(DisplayRow(13), 6)]
         );
     });
 
     // Diagnostics are added for another earlier path.
-    project.update(cx, |project, cx| {
-        project.disk_based_diagnostics_started(language_server_id, cx);
-        project
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.disk_based_diagnostics_started(language_server_id, cx);
+        lsp_store
             .update_diagnostic_entries(
                 language_server_id,
                 PathBuf::from("/test/consts.rs"),
@@ -236,20 +248,21 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
                 cx,
             )
             .unwrap();
-        project.disk_based_diagnostics_finished(language_server_id, cx);
+        lsp_store.disk_based_diagnostics_finished(language_server_id, cx);
     });
 
-    view.next_notification(cx).await;
+    view.next_notification(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10), cx)
+        .await;
     assert_eq!(
         editor_blocks(&editor, cx),
         [
             (DisplayRow(0), FILE_HEADER.into()),
-            (DisplayRow(2), DIAGNOSTIC_HEADER.into()),
-            (DisplayRow(7), FILE_HEADER.into()),
-            (DisplayRow(9), DIAGNOSTIC_HEADER.into()),
-            (DisplayRow(22), EXCERPT_HEADER.into()),
-            (DisplayRow(23), DIAGNOSTIC_HEADER.into()),
-            (DisplayRow(32), EXCERPT_HEADER.into()),
+            (DisplayRow(3), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(8), FILE_HEADER.into()),
+            (DisplayRow(12), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(25), EXCERPT_HEADER.into()),
+            (DisplayRow(27), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(36), EXCERPT_HEADER.into()),
         ]
     );
 
@@ -264,6 +277,7 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
             // diagnostic group 1
             "\n", // primary message
             "\n", // padding
+            "\n", // expand
             "const a: i32 = 'a';\n",
             "\n", // supporting diagnostic
             "const b: i32 = c;\n",
@@ -275,6 +289,8 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
             // diagnostic group 1
             "\n", // primary message
             "\n", // padding
+            "\n", // expand
+            "\n", // expand
             "    let x = vec![];\n",
             "    let y = vec![];\n",
             "\n", // supporting diagnostic
@@ -290,6 +306,7 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
             // diagnostic group 2
             "\n", // primary message
             "\n", // filename
+            "\n", // expand
             "fn main() {\n",
             "    let x = vec![];\n",
             "\n", // supporting diagnostic
@@ -297,11 +314,13 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
             "    a(x);\n",
             "\n", // supporting diagnostic
             "    b(y);\n",
+            "\n", // expand
             "\n", // context ellipsis
             "    c(y);\n",
             "    d(x);\n",
             "\n", // supporting diagnostic
-            "}"
+            "}",
+            "\n", // expand
         )
     );
 
@@ -309,14 +328,14 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
     editor.update(cx, |editor, cx| {
         assert_eq!(
             editor.selections.display_ranges(cx),
-            [DisplayPoint::new(DisplayRow(19), 6)..DisplayPoint::new(DisplayRow(19), 6)]
+            [DisplayPoint::new(DisplayRow(22), 6)..DisplayPoint::new(DisplayRow(22), 6)]
         );
     });
 
     // Diagnostics are added to the first path
-    project.update(cx, |project, cx| {
-        project.disk_based_diagnostics_started(language_server_id, cx);
-        project
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.disk_based_diagnostics_started(language_server_id, cx);
+        lsp_store
             .update_diagnostic_entries(
                 language_server_id,
                 PathBuf::from("/test/consts.rs"),
@@ -348,22 +367,23 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
                 cx,
             )
             .unwrap();
-        project.disk_based_diagnostics_finished(language_server_id, cx);
+        lsp_store.disk_based_diagnostics_finished(language_server_id, cx);
     });
 
-    view.next_notification(cx).await;
+    view.next_notification(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10), cx)
+        .await;
     assert_eq!(
         editor_blocks(&editor, cx),
         [
             (DisplayRow(0), FILE_HEADER.into()),
-            (DisplayRow(2), DIAGNOSTIC_HEADER.into()),
-            (DisplayRow(7), EXCERPT_HEADER.into()),
-            (DisplayRow(8), DIAGNOSTIC_HEADER.into()),
-            (DisplayRow(13), FILE_HEADER.into()),
-            (DisplayRow(15), DIAGNOSTIC_HEADER.into()),
-            (DisplayRow(28), EXCERPT_HEADER.into()),
-            (DisplayRow(29), DIAGNOSTIC_HEADER.into()),
-            (DisplayRow(38), EXCERPT_HEADER.into()),
+            (DisplayRow(3), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(8), EXCERPT_HEADER.into()),
+            (DisplayRow(10), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(15), FILE_HEADER.into()),
+            (DisplayRow(19), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(32), EXCERPT_HEADER.into()),
+            (DisplayRow(34), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(43), EXCERPT_HEADER.into()),
         ]
     );
 
@@ -378,6 +398,7 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
             // diagnostic group 1
             "\n", // primary message
             "\n", // padding
+            "\n", // expand
             "const a: i32 = 'a';\n",
             "\n", // supporting diagnostic
             "const b: i32 = c;\n",
@@ -385,6 +406,7 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
             // diagnostic group 2
             "\n", // primary message
             "\n", // padding
+            "\n", // expand
             "const a: i32 = 'a';\n",
             "const b: i32 = c;\n",
             "\n", // supporting diagnostic
@@ -396,6 +418,8 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
             // diagnostic group 1
             "\n", // primary message
             "\n", // padding
+            "\n", // expand
+            "\n", // expand
             "    let x = vec![];\n",
             "    let y = vec![];\n",
             "\n", // supporting diagnostic
@@ -411,6 +435,7 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
             // diagnostic group 2
             "\n", // primary message
             "\n", // filename
+            "\n", // expand
             "fn main() {\n",
             "    let x = vec![];\n",
             "\n", // supporting diagnostic
@@ -418,11 +443,13 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
             "    a(x);\n",
             "\n", // supporting diagnostic
             "    b(y);\n",
+            "\n", // expand
             "\n", // context ellipsis
             "    c(y);\n",
             "    d(x);\n",
             "\n", // supporting diagnostic
-            "}"
+            "}",
+            "\n", // expand
         )
     );
 }
@@ -449,20 +476,27 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
     let server_id_1 = LanguageServerId(100);
     let server_id_2 = LanguageServerId(101);
     let project = Project::test(fs.clone(), ["/test".as_ref()], cx).await;
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
     let window = cx.add_window(|cx| Workspace::test_new(project.clone(), cx));
     let cx = &mut VisualTestContext::from_window(*window, cx);
     let workspace = window.root(cx).unwrap();
 
     let view = window.build_view(cx, |cx| {
-        ProjectDiagnosticsEditor::new_with_context(1, project.clone(), workspace.downgrade(), cx)
+        ProjectDiagnosticsEditor::new_with_context(
+            1,
+            true,
+            project.clone(),
+            workspace.downgrade(),
+            cx,
+        )
     });
     let editor = view.update(cx, |view, _| view.editor.clone());
 
     // Two language servers start updating diagnostics
-    project.update(cx, |project, cx| {
-        project.disk_based_diagnostics_started(server_id_1, cx);
-        project.disk_based_diagnostics_started(server_id_2, cx);
-        project
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.disk_based_diagnostics_started(server_id_1, cx);
+        lsp_store.disk_based_diagnostics_started(server_id_2, cx);
+        lsp_store
             .update_diagnostic_entries(
                 server_id_1,
                 PathBuf::from("/test/main.js"),
@@ -484,17 +518,19 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
     });
 
     // The first language server finishes
-    project.update(cx, |project, cx| {
-        project.disk_based_diagnostics_finished(server_id_1, cx);
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.disk_based_diagnostics_finished(server_id_1, cx);
     });
 
     // Only the first language server's diagnostics are shown.
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
     cx.executor().run_until_parked();
     assert_eq!(
         editor_blocks(&editor, cx),
         [
             (DisplayRow(0), FILE_HEADER.into()),
-            (DisplayRow(2), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(3), DIAGNOSTIC_HEADER.into()),
         ]
     );
     assert_eq!(
@@ -505,14 +541,15 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
             // diagnostic group 1
             "\n",     // primary message
             "\n",     // padding
+            "\n",     // expand
             "a();\n", //
-            "b();",
+            "b();", "\n", // expand
         )
     );
 
     // The second language server finishes
-    project.update(cx, |project, cx| {
-        project
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store
             .update_diagnostic_entries(
                 server_id_2,
                 PathBuf::from("/test/main.js"),
@@ -531,18 +568,20 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
                 cx,
             )
             .unwrap();
-        project.disk_based_diagnostics_finished(server_id_2, cx);
+        lsp_store.disk_based_diagnostics_finished(server_id_2, cx);
     });
 
     // Both language server's diagnostics are shown.
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
     cx.executor().run_until_parked();
     assert_eq!(
         editor_blocks(&editor, cx),
         [
             (DisplayRow(0), FILE_HEADER.into()),
-            (DisplayRow(2), DIAGNOSTIC_HEADER.into()),
-            (DisplayRow(6), EXCERPT_HEADER.into()),
-            (DisplayRow(7), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(3), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(7), EXCERPT_HEADER.into()),
+            (DisplayRow(9), DIAGNOSTIC_HEADER.into()),
         ]
     );
     assert_eq!(
@@ -553,8 +592,10 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
             // diagnostic group 1
             "\n",     // primary message
             "\n",     // padding
+            "\n",     // expand
             "a();\n", // location
             "b();\n", //
+            "\n",     // expand
             "\n",     // collapsed context
             // diagnostic group 2
             "\n",     // primary message
@@ -562,14 +603,15 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
             "a();\n", // context
             "b();\n", //
             "c();",   // context
+            "\n",     // expand
         )
     );
 
     // Both language servers start updating diagnostics, and the first server finishes.
-    project.update(cx, |project, cx| {
-        project.disk_based_diagnostics_started(server_id_1, cx);
-        project.disk_based_diagnostics_started(server_id_2, cx);
-        project
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.disk_based_diagnostics_started(server_id_1, cx);
+        lsp_store.disk_based_diagnostics_started(server_id_2, cx);
+        lsp_store
             .update_diagnostic_entries(
                 server_id_1,
                 PathBuf::from("/test/main.js"),
@@ -588,7 +630,7 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
                 cx,
             )
             .unwrap();
-        project
+        lsp_store
             .update_diagnostic_entries(
                 server_id_2,
                 PathBuf::from("/test/main.rs"),
@@ -597,18 +639,20 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
                 cx,
             )
             .unwrap();
-        project.disk_based_diagnostics_finished(server_id_1, cx);
+        lsp_store.disk_based_diagnostics_finished(server_id_1, cx);
     });
 
     // Only the first language server's diagnostics are updated.
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
     cx.executor().run_until_parked();
     assert_eq!(
         editor_blocks(&editor, cx),
         [
             (DisplayRow(0), FILE_HEADER.into()),
-            (DisplayRow(2), DIAGNOSTIC_HEADER.into()),
-            (DisplayRow(7), EXCERPT_HEADER.into()),
-            (DisplayRow(8), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(3), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(8), EXCERPT_HEADER.into()),
+            (DisplayRow(10), DIAGNOSTIC_HEADER.into()),
         ]
     );
     assert_eq!(
@@ -619,9 +663,11 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
             // diagnostic group 1
             "\n",     // primary message
             "\n",     // padding
+            "\n",     // expand
             "a();\n", // location
             "b();\n", //
             "c();\n", // context
+            "\n",     // expand
             "\n",     // collapsed context
             // diagnostic group 2
             "\n",     // primary message
@@ -629,12 +675,13 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
             "b();\n", // context
             "c();\n", //
             "d();",   // context
+            "\n",     // expand
         )
     );
 
     // The second language server finishes.
-    project.update(cx, |project, cx| {
-        project
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store
             .update_diagnostic_entries(
                 server_id_2,
                 PathBuf::from("/test/main.js"),
@@ -653,18 +700,20 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
                 cx,
             )
             .unwrap();
-        project.disk_based_diagnostics_finished(server_id_2, cx);
+        lsp_store.disk_based_diagnostics_finished(server_id_2, cx);
     });
 
     // Both language servers' diagnostics are updated.
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
     cx.executor().run_until_parked();
     assert_eq!(
         editor_blocks(&editor, cx),
         [
             (DisplayRow(0), FILE_HEADER.into()),
-            (DisplayRow(2), DIAGNOSTIC_HEADER.into()),
-            (DisplayRow(7), EXCERPT_HEADER.into()),
-            (DisplayRow(8), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(3), DIAGNOSTIC_HEADER.into()),
+            (DisplayRow(8), EXCERPT_HEADER.into()),
+            (DisplayRow(10), DIAGNOSTIC_HEADER.into()),
         ]
     );
     assert_eq!(
@@ -675,9 +724,11 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
             // diagnostic group 1
             "\n",     // primary message
             "\n",     // padding
+            "\n",     // expand
             "b();\n", // location
             "c();\n", //
             "d();\n", // context
+            "\n",     // expand
             "\n",     // collapsed context
             // diagnostic group 2
             "\n",     // primary message
@@ -685,6 +736,7 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
             "c();\n", // context
             "d();\n", //
             "e();",   // context
+            "\n",     // expand
         )
     );
 }
@@ -701,12 +753,19 @@ async fn test_random_diagnostics(cx: &mut TestAppContext, mut rng: StdRng) {
     fs.insert_tree("/test", json!({})).await;
 
     let project = Project::test(fs.clone(), ["/test".as_ref()], cx).await;
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
     let window = cx.add_window(|cx| Workspace::test_new(project.clone(), cx));
     let cx = &mut VisualTestContext::from_window(*window, cx);
     let workspace = window.root(cx).unwrap();
 
     let mutated_view = window.build_view(cx, |cx| {
-        ProjectDiagnosticsEditor::new_with_context(1, project.clone(), workspace.downgrade(), cx)
+        ProjectDiagnosticsEditor::new_with_context(
+            1,
+            true,
+            project.clone(),
+            workspace.downgrade(),
+            cx,
+        )
     });
 
     workspace.update(cx, |workspace, cx| {
@@ -731,8 +790,8 @@ async fn test_random_diagnostics(cx: &mut TestAppContext, mut rng: StdRng) {
             0..=20 if !updated_language_servers.is_empty() => {
                 let server_id = *updated_language_servers.iter().choose(&mut rng).unwrap();
                 log::info!("finishing diagnostic check for language server {server_id}");
-                project.update(cx, |project, cx| {
-                    project.disk_based_diagnostics_finished(server_id, cx)
+                lsp_store.update(cx, |lsp_store, cx| {
+                    lsp_store.disk_based_diagnostics_finished(server_id, cx)
                 });
 
                 if rng.gen_bool(0.5) {
@@ -770,16 +829,14 @@ async fn test_random_diagnostics(cx: &mut TestAppContext, mut rng: StdRng) {
                             (
                                 path.clone(),
                                 server_id,
-                                current_diagnostics
-                                    .entry((path, server_id))
-                                    .or_insert(vec![]),
+                                current_diagnostics.entry((path, server_id)).or_default(),
                             )
                         }
                     };
 
                 updated_language_servers.insert(server_id);
 
-                project.update(cx, |project, cx| {
+                lsp_store.update(cx, |lsp_store, cx| {
                     log::info!("updating diagnostics. language server {server_id} path {path:?}");
                     randomly_update_diagnostics_for_path(
                         &fs,
@@ -788,10 +845,12 @@ async fn test_random_diagnostics(cx: &mut TestAppContext, mut rng: StdRng) {
                         &mut next_group_id,
                         &mut rng,
                     );
-                    project
+                    lsp_store
                         .update_diagnostic_entries(server_id, path, None, diagnostics.clone(), cx)
                         .unwrap()
                 });
+                cx.executor()
+                    .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
 
                 cx.run_until_parked();
             }
@@ -799,17 +858,38 @@ async fn test_random_diagnostics(cx: &mut TestAppContext, mut rng: StdRng) {
     }
 
     log::info!("updating mutated diagnostics view");
-    mutated_view.update(cx, |view, _| view.enqueue_update_stale_excerpts(None));
+    mutated_view.update(cx, |view, cx| view.update_stale_excerpts(cx));
     cx.run_until_parked();
 
     log::info!("constructing reference diagnostics view");
     let reference_view = window.build_view(cx, |cx| {
-        ProjectDiagnosticsEditor::new_with_context(1, project.clone(), workspace.downgrade(), cx)
+        ProjectDiagnosticsEditor::new_with_context(
+            1,
+            true,
+            project.clone(),
+            workspace.downgrade(),
+            cx,
+        )
     });
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
     cx.run_until_parked();
 
     let mutated_excerpts = get_diagnostics_excerpts(&mutated_view, cx);
     let reference_excerpts = get_diagnostics_excerpts(&reference_view, cx);
+
+    for ((path, language_server_id), diagnostics) in current_diagnostics {
+        for diagnostic in diagnostics {
+            let found_excerpt = reference_excerpts.iter().any(|info| {
+                let row_range = info.range.context.start.row..info.range.context.end.row;
+                info.path == path.strip_prefix("/test").unwrap()
+                    && info.language_server == language_server_id
+                    && row_range.contains(&diagnostic.range.start.0.row)
+            });
+            assert!(found_excerpt, "diagnostic not found in reference view");
+        }
+    }
+
     assert_eq!(mutated_excerpts, reference_excerpts);
 }
 
@@ -850,8 +930,8 @@ fn get_diagnostics_excerpts(
                 result.push(ExcerptInfo {
                     path: buffer.file().unwrap().path().to_path_buf(),
                     range: ExcerptRange {
-                        context: range.context.to_point(&buffer),
-                        primary: range.primary.map(|range| range.to_point(&buffer)),
+                        context: range.context.to_point(buffer),
+                        primary: range.primary.map(|range| range.to_point(buffer)),
                     },
                     group_id: usize::MAX,
                     primary: false,
@@ -959,9 +1039,8 @@ fn random_diagnostic(
     }
 }
 
-const FILE_HEADER: &'static str = "file header";
-const EXCERPT_HEADER: &'static str = "excerpt header";
-const EXCERPT_FOOTER: &'static str = "excerpt footer";
+const FILE_HEADER: &str = "file header";
+const EXCERPT_HEADER: &str = "excerpt header";
 
 fn editor_blocks(
     editor: &View<Editor>,
@@ -986,6 +1065,7 @@ fn editor_blocks(
                                     em_width: px(0.),
                                     max_width: px(0.),
                                     block_id,
+                                    selected: false,
                                     editor_style: &editor::EditorStyle::default(),
                                 });
                                 let element = element.downcast_mut::<Stateful<Div>>().unwrap();
@@ -997,7 +1077,8 @@ fn editor_blocks(
                                     .ok()?
                             }
 
-                            Block::ExcerptHeader {
+                            Block::FoldedBuffer { .. } => FILE_HEADER.into(),
+                            Block::ExcerptBoundary {
                                 starts_new_buffer, ..
                             } => {
                                 if *starts_new_buffer {
@@ -1006,7 +1087,6 @@ fn editor_blocks(
                                     EXCERPT_HEADER.into()
                                 }
                             }
-                            Block::ExcerptFooter { .. } => EXCERPT_FOOTER.into(),
                         };
 
                         Some((row, name))

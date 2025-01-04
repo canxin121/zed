@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 use std::ops::Range;
 
 use gpui::{FontWeight, HighlightStyle, StyledText};
@@ -53,11 +55,31 @@ impl LabelCommon for HighlightedLabel {
         self.base = self.base.italic(italic);
         self
     }
+
+    fn alpha(mut self, alpha: f32) -> Self {
+        self.base = self.base.alpha(alpha);
+        self
+    }
+
+    fn underline(mut self, underline: bool) -> Self {
+        self.base = self.base.underline(underline);
+        self
+    }
+
+    fn text_ellipsis(mut self) -> Self {
+        self.base = self.base.text_ellipsis();
+        self
+    }
+
+    fn single_line(mut self) -> Self {
+        self.base = self.base.single_line();
+        self
+    }
 }
 
 pub fn highlight_ranges(
     text: &str,
-    indices: &Vec<usize>,
+    indices: &[usize],
     style: HighlightStyle,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
     let mut highlight_indices = indices.iter().copied().peekable();

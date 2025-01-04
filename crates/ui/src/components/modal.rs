@@ -1,6 +1,8 @@
+#![allow(missing_docs)]
+
 use crate::{
-    h_flex, rems_from_px, v_flex, Clickable, Color, Headline, HeadlineSize, IconButton,
-    IconButtonShape, IconName, Label, LabelCommon, LabelSize, Spacing,
+    h_flex, v_flex, Clickable, Color, DynamicSpacing, Headline, HeadlineSize, IconButton,
+    IconButtonShape, IconName, Label, LabelCommon, LabelSize,
 };
 use gpui::{prelude::FluentBuilder, *};
 use smallvec::SmallVec;
@@ -75,7 +77,8 @@ impl RenderOnce for Modal {
                 v_flex()
                     .id(self.container_id.clone())
                     .w_full()
-                    .gap(Spacing::Large.rems(cx))
+                    .flex_1()
+                    .gap(DynamicSpacing::Base08.rems(cx))
                     .when_some(
                         self.container_scroll_handler,
                         |this, container_scroll_handle| {
@@ -95,6 +98,12 @@ pub struct ModalHeader {
     children: SmallVec<[AnyElement; 2]>,
     show_dismiss_button: bool,
     show_back_button: bool,
+}
+
+impl Default for ModalHeader {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ModalHeader {
@@ -151,10 +160,10 @@ impl RenderOnce for ModalHeader {
             .flex_none()
             .justify_between()
             .w_full()
-            .px(Spacing::XLarge.rems(cx))
-            .pt(Spacing::Large.rems(cx))
-            .pb(Spacing::Small.rems(cx))
-            .gap(Spacing::Large.rems(cx))
+            .px(DynamicSpacing::Base12.rems(cx))
+            .pt(DynamicSpacing::Base08.rems(cx))
+            .pb(DynamicSpacing::Base04.rems(cx))
+            .gap(DynamicSpacing::Base08.rems(cx))
             .when(self.show_back_button, |this| {
                 this.child(
                     IconButton::new("back", IconName::ArrowLeft)
@@ -182,6 +191,12 @@ pub struct ModalRow {
     children: SmallVec<[AnyElement; 2]>,
 }
 
+impl Default for ModalRow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ModalRow {
     pub fn new() -> Self {
         Self {
@@ -198,7 +213,7 @@ impl ParentElement for ModalRow {
 
 impl RenderOnce for ModalRow {
     fn render(self, _cx: &mut WindowContext) -> impl IntoElement {
-        h_flex().w_full().px_2().py_1().children(self.children)
+        h_flex().w_full().py_1().children(self.children)
     }
 }
 
@@ -206,6 +221,12 @@ impl RenderOnce for ModalRow {
 pub struct ModalFooter {
     start_slot: Option<AnyElement>,
     end_slot: Option<AnyElement>,
+}
+
+impl Default for ModalFooter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ModalFooter {
@@ -232,7 +253,7 @@ impl RenderOnce for ModalFooter {
         h_flex()
             .flex_none()
             .w_full()
-            .p(Spacing::Large.rems(cx))
+            .p(DynamicSpacing::Base08.rems(cx))
             .justify_between()
             .child(div().when_some(self.start_slot, |this, start_slot| this.child(start_slot)))
             .child(div().when_some(self.end_slot, |this, end_slot| this.child(end_slot)))
@@ -242,15 +263,23 @@ impl RenderOnce for ModalFooter {
 #[derive(IntoElement)]
 pub struct Section {
     contained: bool,
+    padded: bool,
     header: Option<SectionHeader>,
     meta: Option<SharedString>,
     children: SmallVec<[AnyElement; 2]>,
+}
+
+impl Default for Section {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Section {
     pub fn new() -> Self {
         Self {
             contained: false,
+            padded: true,
             header: None,
             meta: None,
             children: SmallVec::new(),
@@ -260,6 +289,7 @@ impl Section {
     pub fn new_contained() -> Self {
         Self {
             contained: true,
+            padded: true,
             header: None,
             meta: None,
             children: SmallVec::new(),
@@ -280,6 +310,10 @@ impl Section {
         self.meta = Some(meta.into());
         self
     }
+    pub fn padded(mut self, padded: bool) -> Self {
+        self.padded = padded;
+        self
+    }
 }
 
 impl ParentElement for Section {
@@ -294,23 +328,28 @@ impl RenderOnce for Section {
         section_bg.fade_out(0.96);
 
         let children = if self.contained {
-            v_flex().flex_1().px(Spacing::XLarge.rems(cx)).child(
-                v_flex()
-                    .w_full()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .bg(section_bg)
-                    .py(Spacing::Medium.rems(cx))
-                    .px(Spacing::Large.rems(cx) - rems_from_px(1.0))
-                    .gap_y(Spacing::Small.rems(cx))
-                    .child(div().flex().flex_1().size_full().children(self.children)),
-            )
+            v_flex()
+                .flex_1()
+                .when(self.padded, |this| this.px(DynamicSpacing::Base12.rems(cx)))
+                .child(
+                    v_flex()
+                        .w_full()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .bg(section_bg)
+                        .py(DynamicSpacing::Base06.rems(cx))
+                        .gap_y(DynamicSpacing::Base04.rems(cx))
+                        .child(div().flex().flex_1().size_full().children(self.children)),
+                )
         } else {
             v_flex()
                 .w_full()
-                .gap_y(Spacing::Small.rems(cx))
-                .px(Spacing::Large.rems(cx) + Spacing::Large.rems(cx))
+                .flex_1()
+                .gap_y(DynamicSpacing::Base04.rems(cx))
+                .when(self.padded, |this| {
+                    this.px(DynamicSpacing::Base06.rems(cx) + DynamicSpacing::Base06.rems(cx))
+                })
                 .children(self.children)
         };
 
@@ -320,7 +359,7 @@ impl RenderOnce for Section {
             .child(
                 v_flex()
                     .flex_none()
-                    .px(Spacing::XLarge.rems(cx))
+                    .px(DynamicSpacing::Base12.rems(cx))
                     .children(self.header)
                     .when_some(self.meta, |this, meta| {
                         this.child(Label::new(meta).size(LabelSize::Small).color(Color::Muted))
@@ -360,7 +399,7 @@ impl RenderOnce for SectionHeader {
         h_flex()
             .id(self.label.clone())
             .w_full()
-            .px(Spacing::Large.rems(cx))
+            .px(DynamicSpacing::Base08.rems(cx))
             .child(
                 div()
                     .h_7()
@@ -368,7 +407,7 @@ impl RenderOnce for SectionHeader {
                     .items_center()
                     .justify_between()
                     .w_full()
-                    .gap(Spacing::Small.rems(cx))
+                    .gap(DynamicSpacing::Base04.rems(cx))
                     .child(
                         div().flex_1().child(
                             Label::new(self.label.clone())
@@ -381,15 +420,15 @@ impl RenderOnce for SectionHeader {
     }
 }
 
-impl Into<SectionHeader> for SharedString {
-    fn into(self) -> SectionHeader {
-        SectionHeader::new(self)
+impl From<SharedString> for SectionHeader {
+    fn from(val: SharedString) -> Self {
+        SectionHeader::new(val)
     }
 }
 
-impl Into<SectionHeader> for &'static str {
-    fn into(self) -> SectionHeader {
-        let label: SharedString = self.into();
+impl From<&'static str> for SectionHeader {
+    fn from(val: &'static str) -> Self {
+        let label: SharedString = val.into();
         SectionHeader::new(label)
     }
 }

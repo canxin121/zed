@@ -19,12 +19,37 @@ pub struct KeymapFile(Vec<KeymapBlock>);
 pub struct KeymapBlock {
     #[serde(default)]
     context: Option<String>,
+    #[serde(default)]
+    use_key_equivalents: Option<bool>,
     bindings: BTreeMap<String, KeymapAction>,
+}
+
+impl KeymapBlock {
+    pub fn context(&self) -> Option<&str> {
+        self.context.as_deref()
+    }
+
+    pub fn bindings(&self) -> &BTreeMap<String, KeymapAction> {
+        &self.bindings
+    }
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(transparent)]
 pub struct KeymapAction(Value);
+
+impl std::fmt::Display for KeymapAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Value::String(s) => write!(f, "{}", s),
+            Value::Array(arr) => {
+                let strings: Vec<String> = arr.iter().map(|v| v.to_string()).collect();
+                write!(f, "{}", strings.join(", "))
+            }
+            _ => write!(f, "{}", self.0),
+        }
+    }
+}
 
 impl JsonSchema for KeymapAction {
     fn schema_name() -> String {
@@ -35,9 +60,6 @@ impl JsonSchema for KeymapAction {
         Schema::Bool(true)
     }
 }
-
-#[derive(Deserialize)]
-struct ActionWithData(Box<str>, Value);
 
 impl KeymapFile {
     pub fn load_asset(asset_path: &str, cx: &mut AppContext) -> Result<()> {
@@ -54,7 +76,14 @@ impl KeymapFile {
     }
 
     pub fn add_to_cx(self, cx: &mut AppContext) -> Result<()> {
-        for KeymapBlock { context, bindings } in self.0 {
+        let key_equivalents = crate::key_equivalents::get_key_equivalents(&cx.keyboard_layout());
+
+        for KeymapBlock {
+            context,
+            use_key_equivalents,
+            bindings,
+        } in self.0
+        {
             let bindings = bindings
                 .into_iter()
                 .filter_map(|(keystroke, action)| {
@@ -90,7 +119,18 @@ impl KeymapFile {
                         )
                     })
                     .log_err()
-                    .map(|action| KeyBinding::load(&keystroke, action, context.as_deref()))
+                    .map(|action| {
+                        KeyBinding::load(
+                            &keystroke,
+                            action,
+                            context.as_deref(),
+                            if use_key_equivalents.unwrap_or_default() {
+                                key_equivalents.as_ref()
+                            } else {
+                                None
+                            },
+                        )
+                    })
                 })
                 .collect::<Result<Vec<_>>>()?;
 
@@ -137,6 +177,10 @@ impl KeymapFile {
             .insert("KeymapAction".to_owned(), action_schema);
 
         serde_json::to_value(root_schema).unwrap()
+    }
+
+    pub fn blocks(&self) -> &[KeymapBlock] {
+        &self.0
     }
 }
 

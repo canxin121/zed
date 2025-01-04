@@ -1,13 +1,82 @@
 use crate::{request::PromptUserDeviceFlow, Copilot, Status};
 use gpui::{
-    div, svg, AppContext, ClipboardItem, DismissEvent, Element, EventEmitter, FocusHandle,
+    div, AppContext, ClipboardItem, DismissEvent, Element, EventEmitter, FocusHandle,
     FocusableView, InteractiveElement, IntoElement, Model, MouseDownEvent, ParentElement, Render,
     Styled, Subscription, ViewContext,
 };
-use ui::{prelude::*, Button, IconName, Label};
-use workspace::ModalView;
+use ui::{prelude::*, Button, Label, Vector, VectorName};
+use util::ResultExt as _;
+use workspace::notifications::NotificationId;
+use workspace::{ModalView, Toast, Workspace};
 
 const COPILOT_SIGN_UP_URL: &str = "https://github.com/features/copilot";
+
+struct CopilotStartingToast;
+
+pub fn initiate_sign_in(cx: &mut WindowContext) {
+    let Some(copilot) = Copilot::global(cx) else {
+        return;
+    };
+    let status = copilot.read(cx).status();
+    let Some(workspace) = cx.window_handle().downcast::<Workspace>() else {
+        return;
+    };
+    match status {
+        Status::Starting { task } => {
+            let Some(workspace) = cx.window_handle().downcast::<Workspace>() else {
+                return;
+            };
+
+            let Ok(workspace) = workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::unique::<CopilotStartingToast>(),
+                        "Copilot is starting...",
+                    ),
+                    cx,
+                );
+                workspace.weak_handle()
+            }) else {
+                return;
+            };
+
+            cx.spawn(|mut cx| async move {
+                task.await;
+                if let Some(copilot) = cx.update(|cx| Copilot::global(cx)).ok().flatten() {
+                    workspace
+                        .update(&mut cx, |workspace, cx| match copilot.read(cx).status() {
+                            Status::Authorized => workspace.show_toast(
+                                Toast::new(
+                                    NotificationId::unique::<CopilotStartingToast>(),
+                                    "Copilot has started!",
+                                ),
+                                cx,
+                            ),
+                            _ => {
+                                workspace.dismiss_toast(
+                                    &NotificationId::unique::<CopilotStartingToast>(),
+                                    cx,
+                                );
+                                copilot
+                                    .update(cx, |copilot, cx| copilot.sign_in(cx))
+                                    .detach_and_log_err(cx);
+                            }
+                        })
+                        .log_err();
+                }
+            })
+            .detach();
+        }
+        _ => {
+            copilot.update(cx, |this, cx| this.sign_in(cx)).detach();
+            workspace
+                .update(cx, |this, cx| {
+                    this.toggle_modal(cx, |cx| CopilotCodeVerification::new(&copilot, cx));
+                })
+                .ok();
+        }
+    }
+}
 
 pub struct CopilotCodeVerification {
     status: Status,
@@ -55,7 +124,7 @@ impl CopilotCodeVerification {
     ) -> impl IntoElement {
         let copied = cx
             .read_from_clipboard()
-            .map(|item| item.text() == &data.user_code)
+            .map(|item| item.text().as_ref() == Some(&data.user_code))
             .unwrap_or(false);
         h_flex()
             .w_full()
@@ -68,7 +137,7 @@ impl CopilotCodeVerification {
             .on_mouse_down(gpui::MouseButton::Left, {
                 let user_code = data.user_code.clone();
                 move |_, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new(user_code.clone()));
+                    cx.write_to_clipboard(ClipboardItem::new_string(user_code.clone()));
                     cx.refresh();
                 }
             })
@@ -167,7 +236,7 @@ impl Render for CopilotCodeVerification {
         let prompt = match &self.status {
             Status::SigningIn {
                 prompt: Some(prompt),
-            } => Self::render_prompting_modal(self.connect_clicked, &prompt, cx).into_any_element(),
+            } => Self::render_prompting_modal(self.connect_clicked, prompt, cx).into_any_element(),
             Status::Unauthorized => {
                 self.connect_clicked = false;
                 Self::render_unauthorized_modal(cx).into_any_element()
@@ -185,7 +254,7 @@ impl Render for CopilotCodeVerification {
 
         v_flex()
             .id("copilot code verification")
-            .track_focus(&self.focus_handle)
+            .track_focus(&self.focus_handle(cx))
             .elevation_3(cx)
             .w_96()
             .items_center()
@@ -198,12 +267,8 @@ impl Render for CopilotCodeVerification {
                 cx.focus(&this.focus_handle);
             }))
             .child(
-                svg()
-                    .w_32()
-                    .h_16()
-                    .flex_none()
-                    .path(IconName::ZedXCopilot.path())
-                    .text_color(cx.theme().colors().icon),
+                Vector::new(VectorName::ZedXCopilot, rems(8.), rems(4.))
+                    .color(Color::Custom(cx.theme().colors().icon)),
             )
             .child(prompt)
     }

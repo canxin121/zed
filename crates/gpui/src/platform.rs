@@ -4,13 +4,20 @@
 mod app_menu;
 mod keystroke;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod linux;
 
 #[cfg(target_os = "macos")]
 mod mac;
 
-#[cfg(any(target_os = "linux", target_os = "windows", feature = "macos-blade"))]
+#[cfg(any(
+    all(
+        any(target_os = "linux", target_os = "freebsd"),
+        any(feature = "x11", feature = "wayland")
+    ),
+    target_os = "windows",
+    feature = "macos-blade"
+))]
 mod blade;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -21,20 +28,25 @@ mod windows;
 
 use crate::{
     point, Action, AnyWindowHandle, AsyncWindowContext, BackgroundExecutor, Bounds, DevicePixels,
-    DispatchEventResult, Font, FontId, FontMetrics, FontRun, ForegroundExecutor, GPUSpecs, GlyphId,
-    Keymap, LineLayout, Pixels, PlatformInput, Point, RenderGlyphParams, RenderImageParams,
-    RenderSvgParams, Scene, SharedString, Size, Task, TaskLabel, WindowContext,
-    DEFAULT_WINDOW_SIZE,
+    DispatchEventResult, Font, FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs,
+    ImageSource, Keymap, LineLayout, Pixels, PlatformInput, Point, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, ScaledPixels, Scene, SharedString, Size, SvgRenderer,
+    SvgSize, Task, TaskLabel, WindowContext, DEFAULT_WINDOW_SIZE,
 };
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_task::Runnable;
 use futures::channel::oneshot;
+use image::codecs::gif::GifDecoder;
+use image::{AnimationDecoder as _, Frame};
 use parking::Unparker;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use seahash::SeaHasher;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
+use std::io::Cursor;
+use std::ops;
 use std::time::{Duration, Instant};
 use std::{
     fmt::{self, Debug},
@@ -43,12 +55,13 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
+use strum::EnumIter;
 use uuid::Uuid;
 
 pub use app_menu::*;
 pub use keystroke::*;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) use linux::*;
 #[cfg(target_os = "macos")]
 pub(crate) use mac::*;
@@ -58,20 +71,27 @@ pub(crate) use test::*;
 #[cfg(target_os = "windows")]
 pub(crate) use windows::*;
 
+#[cfg(any(test, feature = "test-support"))]
+pub use test::TestScreenCaptureSource;
+
 #[cfg(target_os = "macos")]
 pub(crate) fn current_platform(headless: bool) -> Rc<dyn Platform> {
     Rc::new(MacPlatform::new(headless))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) fn current_platform(headless: bool) -> Rc<dyn Platform> {
     if headless {
         return Rc::new(HeadlessClient::new());
     }
 
     match guess_compositor() {
+        #[cfg(feature = "wayland")]
         "Wayland" => Rc::new(WaylandClient::new()),
+
+        #[cfg(feature = "x11")]
         "X11" => Rc::new(X11Client::new()),
+
         "Headless" => Rc::new(HeadlessClient::new()),
         _ => unreachable!(),
     }
@@ -79,14 +99,22 @@ pub(crate) fn current_platform(headless: bool) -> Rc<dyn Platform> {
 
 /// Return which compositor we're guessing we'll use.
 /// Does not attempt to connect to the given compositor
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[inline]
 pub fn guess_compositor() -> &'static str {
     if std::env::var_os("ZED_HEADLESS").is_some() {
         return "Headless";
     }
+
+    #[cfg(feature = "wayland")]
     let wayland_display = std::env::var_os("WAYLAND_DISPLAY");
+    #[cfg(not(feature = "wayland"))]
+    let wayland_display: Option<std::ffi::OsString> = None;
+
+    #[cfg(feature = "x11")]
     let x11_display = std::env::var_os("DISPLAY");
+    #[cfg(not(feature = "x11"))]
+    let x11_display: Option<std::ffi::OsString> = None;
 
     let use_wayland = wayland_display.is_some_and(|display| !display.is_empty());
     let use_x11 = x11_display.is_some_and(|display| !display.is_empty());
@@ -121,6 +149,13 @@ pub(crate) trait Platform: 'static {
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>>;
     fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn active_window(&self) -> Option<AnyWindowHandle>;
+    fn window_stack(&self) -> Option<Vec<AnyWindowHandle>> {
+        None
+    }
+
+    fn screen_capture_sources(
+        &self,
+    ) -> oneshot::Receiver<Result<Vec<Box<dyn ScreenCaptureSource>>>>;
 
     fn open_window(
         &self,
@@ -141,9 +176,11 @@ pub(crate) trait Platform: 'static {
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>>;
     fn prompt_for_new_path(&self, directory: &Path) -> oneshot::Receiver<Result<Option<PathBuf>>>;
     fn reveal_path(&self, path: &Path);
+    fn open_with_system(&self, path: &Path);
 
     fn on_quit(&self, callback: Box<dyn FnMut()>);
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
+    fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
 
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap);
     fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
@@ -155,6 +192,7 @@ pub(crate) trait Platform: 'static {
     fn on_app_menu_action(&self, callback: Box<dyn FnMut(&dyn Action)>);
     fn on_will_open_app_menu(&self, callback: Box<dyn FnMut()>);
     fn on_validate_app_menu_command(&self, callback: Box<dyn FnMut(&dyn Action) -> bool>);
+    fn keyboard_layout(&self) -> String;
 
     fn compositor_name(&self) -> &'static str {
         ""
@@ -165,10 +203,10 @@ pub(crate) trait Platform: 'static {
     fn set_cursor_style(&self, style: CursorStyle);
     fn should_auto_hide_scrollbars(&self) -> bool;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn write_to_primary(&self, item: ClipboardItem);
     fn write_to_clipboard(&self, item: ClipboardItem);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn read_from_primary(&self) -> Option<ClipboardItem>;
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
 
@@ -197,6 +235,25 @@ pub trait PlatformDisplay: Send + Sync + Debug {
         Bounds::new(origin, DEFAULT_WINDOW_SIZE)
     }
 }
+
+/// A source of on-screen video content that can be captured.
+pub trait ScreenCaptureSource {
+    /// Returns the video resolution of this source.
+    fn resolution(&self) -> Result<Size<Pixels>>;
+
+    /// Start capture video from this source, invoking the given callback
+    /// with each frame.
+    fn stream(
+        &self,
+        frame_callback: Box<dyn Fn(ScreenCaptureFrame)>,
+    ) -> oneshot::Receiver<Result<Box<dyn ScreenCaptureStream>>>;
+}
+
+/// A video stream captured from a screen.
+pub trait ScreenCaptureStream {}
+
+/// A frame of video captured from a screen.
+pub struct ScreenCaptureFrame(pub PlatformScreenCaptureFrame);
 
 /// An opaque identifier for a hardware display
 #[derive(PartialEq, Eq, Hash, Copy, Clone)]
@@ -255,7 +312,7 @@ pub enum Decorations {
 }
 
 /// What window controls this platform supports
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct WindowControls {
     /// Whether this platform supports fullscreen
     pub fullscreen: bool,
@@ -265,6 +322,18 @@ pub struct WindowControls {
     pub minimize: bool,
     /// Whether this platform supports a window menu
     pub window_menu: bool,
+}
+
+impl Default for WindowControls {
+    fn default() -> Self {
+        // Assume that we can do anything, unless told otherwise
+        Self {
+            fullscreen: true,
+            maximize: true,
+            minimize: true,
+            window_menu: true,
+        }
+    }
 }
 
 /// A type to describe which sides of the window are currently tiled in some way
@@ -297,6 +366,11 @@ impl Tiling {
     }
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+pub(crate) struct RequestFrameOptions {
+    pub(crate) require_presentation: bool,
+}
+
 pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
@@ -325,7 +399,7 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn zoom(&self);
     fn toggle_fullscreen(&self);
     fn is_fullscreen(&self) -> bool;
-    fn on_request_frame(&self, callback: Box<dyn FnMut()>);
+    fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>);
@@ -346,6 +420,9 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn get_raw_handle(&self) -> windows::HWND;
 
     // Linux specific methods
+    fn inner_window_bounds(&self) -> WindowBounds {
+        self.window_bounds()
+    }
     fn request_decorations(&self, _decorations: WindowDecorations) {}
     fn show_window_menu(&self, _position: Point<Pixels>) {}
     fn start_window_move(&self) {}
@@ -355,15 +432,12 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn set_app_id(&mut self, _app_id: &str) {}
     fn window_controls(&self) -> WindowControls {
-        WindowControls {
-            fullscreen: true,
-            maximize: true,
-            minimize: true,
-            window_menu: false,
-        }
+        WindowControls::default()
     }
     fn set_client_inset(&self, _inset: Pixels) {}
-    fn gpu_specs(&self) -> Option<GPUSpecs>;
+    fn gpu_specs(&self) -> Option<GpuSpecs>;
+
+    fn update_ime_position(&self, _bounds: Bounds<ScaledPixels>);
 
     #[cfg(any(test, feature = "test-support"))]
     fn as_test(&mut self) -> Option<&mut TestWindow> {
@@ -394,7 +468,6 @@ pub trait PlatformDispatcher: Send + Sync {
 pub(crate) trait PlatformTextSystem: Send + Sync {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()>;
     fn all_font_names(&self) -> Vec<String>;
-    fn all_font_families(&self) -> Vec<String>;
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
     fn font_metrics(&self, font_id: FontId) -> FontMetrics;
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>>;
@@ -409,6 +482,61 @@ pub(crate) trait PlatformTextSystem: Send + Sync {
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout;
 }
 
+pub(crate) struct NoopTextSystem;
+
+impl NoopTextSystem {
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl PlatformTextSystem for NoopTextSystem {
+    fn add_fonts(&self, _fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+        Ok(())
+    }
+
+    fn all_font_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn font_id(&self, descriptor: &Font) -> Result<FontId> {
+        Err(anyhow!("No font found for {:?}", descriptor))
+    }
+
+    fn font_metrics(&self, _font_id: FontId) -> FontMetrics {
+        unimplemented!()
+    }
+
+    fn typographic_bounds(&self, font_id: FontId, _glyph_id: GlyphId) -> Result<Bounds<f32>> {
+        Err(anyhow!("No font found for {:?}", font_id))
+    }
+
+    fn advance(&self, font_id: FontId, _glyph_id: GlyphId) -> Result<Size<f32>> {
+        Err(anyhow!("No font found for {:?}", font_id))
+    }
+
+    fn glyph_for_char(&self, _font_id: FontId, _ch: char) -> Option<GlyphId> {
+        None
+    }
+
+    fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+        Err(anyhow!("No font found for {:?}", params))
+    }
+
+    fn rasterize_glyph(
+        &self,
+        params: &RenderGlyphParams,
+        _raster_bounds: Bounds<DevicePixels>,
+    ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+        Err(anyhow!("No font found for {:?}", params))
+    }
+
+    fn layout_line(&self, _text: &str, _font_size: Pixels, _runs: &[FontRun]) -> LineLayout {
+        unimplemented!()
+    }
+}
+
 #[derive(PartialEq, Eq, Hash, Clone)]
 pub(crate) enum AtlasKey {
     Glyph(RenderGlyphParams),
@@ -417,6 +545,13 @@ pub(crate) enum AtlasKey {
 }
 
 impl AtlasKey {
+    #[cfg_attr(
+        all(
+            any(target_os = "linux", target_os = "freebsd"),
+            not(any(feature = "x11", feature = "wayland"))
+        ),
+        allow(dead_code)
+    )]
     pub(crate) fn texture_kind(&self) -> AtlasTextureKind {
         match self {
             AtlasKey::Glyph(params) => {
@@ -456,6 +591,42 @@ pub(crate) trait PlatformAtlas: Send + Sync {
         key: &AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
+    fn remove(&self, key: &AtlasKey);
+}
+
+struct AtlasTextureList<T> {
+    textures: Vec<Option<T>>,
+    free_list: Vec<usize>,
+}
+
+impl<T> Default for AtlasTextureList<T> {
+    fn default() -> Self {
+        Self {
+            textures: Vec::default(),
+            free_list: Vec::default(),
+        }
+    }
+}
+
+impl<T> ops::Index<usize> for AtlasTextureList<T> {
+    type Output = Option<T>;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.textures[index]
+    }
+}
+
+impl<T> AtlasTextureList<T> {
+    #[allow(unused)]
+    fn drain(&mut self) -> std::vec::Drain<Option<T>> {
+        self.free_list.clear();
+        self.textures.drain(..)
+    }
+
+    #[allow(dead_code)]
+    fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut T> {
+        self.textures.iter_mut().flatten()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -477,6 +648,13 @@ pub(crate) struct AtlasTextureId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
+#[cfg_attr(
+    all(
+        any(target_os = "linux", target_os = "freebsd"),
+        not(any(feature = "x11", feature = "wayland"))
+    ),
+    allow(dead_code)
+)]
 pub(crate) enum AtlasTextureKind {
     Monochrome = 0,
     Polychrome = 1,
@@ -504,14 +682,21 @@ pub(crate) struct PlatformInputHandler {
     handler: Box<dyn InputHandler>,
 }
 
+#[cfg_attr(
+    all(
+        any(target_os = "linux", target_os = "freebsd"),
+        not(any(feature = "x11", feature = "wayland"))
+    ),
+    allow(dead_code)
+)]
 impl PlatformInputHandler {
     pub fn new(cx: AsyncWindowContext, handler: Box<dyn InputHandler>) -> Self {
         Self { cx, handler }
     }
 
-    fn selected_text_range(&mut self) -> Option<Range<usize>> {
+    fn selected_text_range(&mut self, ignore_disabled_input: bool) -> Option<UTF16Selection> {
         self.cx
-            .update(|cx| self.handler.selected_text_range(cx))
+            .update(|cx| self.handler.selected_text_range(ignore_disabled_input, cx))
             .ok()
             .flatten()
     }
@@ -523,10 +708,14 @@ impl PlatformInputHandler {
             .flatten()
     }
 
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
-    fn text_for_range(&mut self, range_utf16: Range<usize>) -> Option<String> {
+    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
+    ) -> Option<String> {
         self.cx
-            .update(|cx| self.handler.text_for_range(range_utf16, cx))
+            .update(|cx| self.handler.text_for_range(range_utf16, adjusted, cx))
             .ok()
             .flatten()
     }
@@ -569,9 +758,38 @@ impl PlatformInputHandler {
             .flatten()
     }
 
+    #[allow(dead_code)]
+    fn apple_press_and_hold_enabled(&mut self) -> bool {
+        self.handler.apple_press_and_hold_enabled()
+    }
+
     pub(crate) fn dispatch_input(&mut self, input: &str, cx: &mut WindowContext) {
         self.handler.replace_text_in_range(None, input, cx);
     }
+
+    pub fn selected_bounds(&mut self, cx: &mut WindowContext) -> Option<Bounds<Pixels>> {
+        let selection = self.handler.selected_text_range(true, cx)?;
+        self.handler.bounds_for_range(
+            if selection.reversed {
+                selection.range.start..selection.range.start
+            } else {
+                selection.range.end..selection.range.end
+            },
+            cx,
+        )
+    }
+}
+
+/// A struct representing a selection in a text buffer, in UTF16 characters.
+/// This is different from a range because the head may be before the tail.
+#[derive(Debug)]
+pub struct UTF16Selection {
+    /// The range of text in the document this selection corresponds to
+    /// in UTF16 characters.
+    pub range: Range<usize>,
+    /// Whether the head of this selection is at the start (true), or end (false)
+    /// of the range
+    pub reversed: bool,
 }
 
 /// Zed's interface for handling text input from the platform's IME system
@@ -583,7 +801,11 @@ pub trait InputHandler: 'static {
     /// Corresponds to [selectedRange()](https://developer.apple.com/documentation/appkit/nstextinputclient/1438242-selectedrange)
     ///
     /// Return value is in terms of UTF-16 characters, from 0 to the length of the document
-    fn selected_text_range(&mut self, cx: &mut WindowContext) -> Option<Range<usize>>;
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled_input: bool,
+        cx: &mut WindowContext,
+    ) -> Option<UTF16Selection>;
 
     /// Get the range of the currently marked text, if any
     /// Corresponds to [markedRange()](https://developer.apple.com/documentation/appkit/nstextinputclient/1438250-markedrange)
@@ -598,6 +820,7 @@ pub trait InputHandler: 'static {
     fn text_for_range(
         &mut self,
         range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
         cx: &mut WindowContext,
     ) -> Option<String>;
 
@@ -613,7 +836,7 @@ pub trait InputHandler: 'static {
     );
 
     /// Replace the text in the given document range with the given text,
-    /// and mark the given text as part of of an IME 'composing' state
+    /// and mark the given text as part of an IME 'composing' state
     /// Corresponds to [setMarkedText(_:selectedRange:replacementRange:)](https://developer.apple.com/documentation/appkit/nstextinputclient/1438246-setmarkedtext)
     ///
     /// range_utf16 is in terms of UTF-16 characters
@@ -639,6 +862,15 @@ pub trait InputHandler: 'static {
         range_utf16: Range<usize>,
         cx: &mut WindowContext,
     ) -> Option<Bounds<Pixels>>;
+
+    /// Allows a given input context to opt into getting raw key repeats instead of
+    /// sending these to the platform.
+    /// TODO: Ideally we should be able to set ApplePressAndHoldEnabled in NSUserDefaults
+    /// (which is how iTerm does it) but it doesn't seem to work for me.
+    #[allow(dead_code)]
+    fn apple_press_and_hold_enabled(&mut self) -> bool {
+        true
+    }
 }
 
 /// The variables that can be configured when creating a new window
@@ -684,26 +916,35 @@ pub struct WindowOptions {
 
 /// The variables that can be configured when creating a new window
 #[derive(Debug)]
+#[cfg_attr(
+    all(
+        any(target_os = "linux", target_os = "freebsd"),
+        not(any(feature = "x11", feature = "wayland"))
+    ),
+    allow(dead_code)
+)]
 pub(crate) struct WindowParams {
     pub bounds: Bounds<Pixels>,
 
     /// The titlebar configuration of the window
+    #[cfg_attr(feature = "wayland", allow(dead_code))]
     pub titlebar: Option<TitlebarOptions>,
 
     /// The kind of window to create
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub kind: WindowKind,
 
     /// Whether the window should be movable by the user
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub is_movable: bool,
 
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub focus: bool,
 
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub show: bool,
 
+    #[cfg_attr(feature = "wayland", allow(dead_code))]
     pub display_id: Option<DisplayId>,
 
     pub window_min_size: Option<Size<Pixels>>,
@@ -767,7 +1008,8 @@ pub struct TitlebarOptions {
     /// The initial title of the window
     pub title: Option<SharedString>,
 
-    /// Whether the titlebar should appear transparent (macOS only)
+    /// Should the default system titlebar be hidden to allow for a custom-drawn titlebar? (macOS and Windows only)
+    /// Refer to [`WindowOptions::window_decorations`] on Linux
     pub appears_transparent: bool,
 
     /// The position of the macOS traffic light buttons
@@ -922,11 +1164,11 @@ pub enum CursorStyle {
     ResizeUpRightDownLeft,
 
     /// A cursor indicating that the item/column can be resized horizontally.
-    /// corresponds to the CSS curosr value `col-resize`
+    /// corresponds to the CSS cursor value `col-resize`
     ResizeColumn,
 
     /// A cursor indicating that the item/row can be resized vertically.
-    /// corresponds to the CSS curosr value `row-resize`
+    /// corresponds to the CSS cursor value `row-resize`
     ResizeRow,
 
     /// A text input cursor for vertical layout
@@ -959,12 +1201,217 @@ impl Default for CursorStyle {
 /// A clipboard item that should be copied to the clipboard
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardItem {
+    entries: Vec<ClipboardEntry>,
+}
+
+/// Either a ClipboardString or a ClipboardImage
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClipboardEntry {
+    /// A string entry
+    String(ClipboardString),
+    /// An image entry
+    Image(Image),
+}
+
+impl ClipboardItem {
+    /// Create a new ClipboardItem::String with no associated metadata
+    pub fn new_string(text: String) -> Self {
+        Self {
+            entries: vec![ClipboardEntry::String(ClipboardString::new(text))],
+        }
+    }
+
+    /// Create a new ClipboardItem::String with the given text and associated metadata
+    pub fn new_string_with_metadata(text: String, metadata: String) -> Self {
+        Self {
+            entries: vec![ClipboardEntry::String(ClipboardString {
+                text,
+                metadata: Some(metadata),
+            })],
+        }
+    }
+
+    /// Create a new ClipboardItem::String with the given text and associated metadata
+    pub fn new_string_with_json_metadata<T: Serialize>(text: String, metadata: T) -> Self {
+        Self {
+            entries: vec![ClipboardEntry::String(
+                ClipboardString::new(text).with_json_metadata(metadata),
+            )],
+        }
+    }
+
+    /// Create a new ClipboardItem::Image with the given image with no associated metadata
+    pub fn new_image(image: &Image) -> Self {
+        Self {
+            entries: vec![ClipboardEntry::Image(image.clone())],
+        }
+    }
+
+    /// Concatenates together all the ClipboardString entries in the item.
+    /// Returns None if there were no ClipboardString entries.
+    pub fn text(&self) -> Option<String> {
+        let mut answer = String::new();
+        let mut any_entries = false;
+
+        for entry in self.entries.iter() {
+            if let ClipboardEntry::String(ClipboardString { text, metadata: _ }) = entry {
+                answer.push_str(text);
+                any_entries = true;
+            }
+        }
+
+        if any_entries {
+            Some(answer)
+        } else {
+            None
+        }
+    }
+
+    /// If this item is one ClipboardEntry::String, returns its metadata.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn metadata(&self) -> Option<&String> {
+        match self.entries().first() {
+            Some(ClipboardEntry::String(clipboard_string)) if self.entries.len() == 1 => {
+                clipboard_string.metadata.as_ref()
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the item's entries
+    pub fn entries(&self) -> &[ClipboardEntry] {
+        &self.entries
+    }
+
+    /// Get owned versions of the item's entries
+    pub fn into_entries(self) -> impl Iterator<Item = ClipboardEntry> {
+        self.entries.into_iter()
+    }
+}
+
+/// One of the editor's supported image formats (e.g. PNG, JPEG) - used when dealing with images in the clipboard
+#[derive(Clone, Copy, Debug, Eq, PartialEq, EnumIter, Hash)]
+pub enum ImageFormat {
+    // Sorted from most to least likely to be pasted into an editor,
+    // which matters when we iterate through them trying to see if
+    // clipboard content matches them.
+    /// .png
+    Png,
+    /// .jpeg or .jpg
+    Jpeg,
+    /// .webp
+    Webp,
+    /// .gif
+    Gif,
+    /// .svg
+    Svg,
+    /// .bmp
+    Bmp,
+    /// .tif or .tiff
+    Tiff,
+}
+
+/// An image, with a format and certain bytes
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Image {
+    /// The image format the bytes represent (e.g. PNG)
+    pub format: ImageFormat,
+    /// The raw image bytes
+    pub bytes: Vec<u8>,
+    /// The unique ID for the image
+    pub id: u64,
+}
+
+impl Hash for Image {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.id);
+    }
+}
+
+impl Image {
+    /// Get this image's ID
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Use the GPUI `use_asset` API to make this image renderable
+    pub fn use_render_image(self: Arc<Self>, cx: &mut WindowContext) -> Option<Arc<RenderImage>> {
+        ImageSource::Image(self)
+            .use_data(cx)
+            .and_then(|result| result.ok())
+    }
+
+    /// Convert the clipboard image to an `ImageData` object.
+    pub fn to_image_data(&self, svg_renderer: SvgRenderer) -> Result<Arc<RenderImage>> {
+        fn frames_for_image(
+            bytes: &[u8],
+            format: image::ImageFormat,
+        ) -> Result<SmallVec<[Frame; 1]>> {
+            let mut data = image::load_from_memory_with_format(bytes, format)?.into_rgba8();
+
+            // Convert from RGBA to BGRA.
+            for pixel in data.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+
+            Ok(SmallVec::from_elem(Frame::new(data), 1))
+        }
+
+        let frames = match self.format {
+            ImageFormat::Gif => {
+                let decoder = GifDecoder::new(Cursor::new(&self.bytes))?;
+                let mut frames = SmallVec::new();
+
+                for frame in decoder.into_frames() {
+                    let mut frame = frame?;
+                    // Convert from RGBA to BGRA.
+                    for pixel in frame.buffer_mut().chunks_exact_mut(4) {
+                        pixel.swap(0, 2);
+                    }
+                    frames.push(frame);
+                }
+
+                frames
+            }
+            ImageFormat::Png => frames_for_image(&self.bytes, image::ImageFormat::Png)?,
+            ImageFormat::Jpeg => frames_for_image(&self.bytes, image::ImageFormat::Jpeg)?,
+            ImageFormat::Webp => frames_for_image(&self.bytes, image::ImageFormat::WebP)?,
+            ImageFormat::Bmp => frames_for_image(&self.bytes, image::ImageFormat::Bmp)?,
+            ImageFormat::Tiff => frames_for_image(&self.bytes, image::ImageFormat::Tiff)?,
+            ImageFormat::Svg => {
+                let pixmap = svg_renderer.render_pixmap(&self.bytes, SvgSize::ScaleFactor(1.0))?;
+
+                let buffer =
+                    image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take())
+                        .unwrap();
+
+                SmallVec::from_elem(Frame::new(buffer), 1)
+            }
+        };
+
+        Ok(Arc::new(RenderImage::new(frames)))
+    }
+
+    /// Get the format of the clipboard image
+    pub fn format(&self) -> ImageFormat {
+        self.format
+    }
+
+    /// Get the raw bytes of the clipboard image
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+}
+
+/// A clipboard item that should be copied to the clipboard
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardString {
     pub(crate) text: String,
     pub(crate) metadata: Option<String>,
 }
 
-impl ClipboardItem {
-    /// Create a new clipboard item with the given text
+impl ClipboardString {
+    /// Create a new clipboard string with the given text
     pub fn new(text: String) -> Self {
         Self {
             text,
@@ -972,19 +1419,25 @@ impl ClipboardItem {
         }
     }
 
-    /// Create a new clipboard item with the given text and metadata
-    pub fn with_metadata<T: Serialize>(mut self, metadata: T) -> Self {
+    /// Return a new clipboard item with the metadata replaced by the given metadata,
+    /// after serializing it as JSON.
+    pub fn with_json_metadata<T: Serialize>(mut self, metadata: T) -> Self {
         self.metadata = Some(serde_json::to_string(&metadata).unwrap());
         self
     }
 
-    /// Get the text of the clipboard item
+    /// Get the text of the clipboard string
     pub fn text(&self) -> &String {
         &self.text
     }
 
-    /// Get the metadata of the clipboard item
-    pub fn metadata<T>(&self) -> Option<T>
+    /// Get the owned text of the clipboard string
+    pub fn into_text(self) -> String {
+        self.text
+    }
+
+    /// Get the metadata of the clipboard string, formatted as JSON
+    pub fn metadata_json<T>(&self) -> Option<T>
     where
         T: for<'a> Deserialize<'a>,
     {
@@ -993,7 +1446,7 @@ impl ClipboardItem {
             .and_then(|m| serde_json::from_str(m).ok())
     }
 
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub(crate) fn text_hash(text: &str) -> u64 {
         let mut hasher = SeaHasher::new();
         text.hash(&mut hasher);

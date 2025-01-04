@@ -1,14 +1,16 @@
 pub mod arc_cow;
+pub mod command;
 pub mod fs;
 pub mod paths;
 pub mod serde;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 
+use anyhow::{anyhow, Context as _, Result};
 use futures::Future;
-use rand::{seq::SliceRandom, Rng};
+use itertools::Either;
 use regex::Regex;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use std::{
     borrow::Cow,
     cmp::{self, Ordering},
@@ -35,142 +37,6 @@ macro_rules! debug_panic {
     };
 }
 
-#[macro_export]
-macro_rules! with_clone {
-    ($i:ident, move ||$l:expr) => {{
-        let $i = $i.clone();
-        move || {
-            $l
-        }
-    }};
-    ($i:ident, move |$($k:pat_param),*|$l:expr) => {{
-        let $i = $i.clone();
-        move |$( $k ),*| {
-            $l
-        }
-    }};
-
-    (($($i:ident),+), move ||$l:expr) => {{
-        let ($($i),+) = ($($i.clone()),+);
-        move || {
-            $l
-        }
-    }};
-    (($($i:ident),+), move |$($k:pat_param),*|$l:expr) => {{
-        let ($($i),+) = ($($i.clone()),+);
-        move |$( $k ),*| {
-            $l
-        }
-    }};
-}
-
-mod test_with_clone {
-
-    // If this test compiles, it works
-    #[test]
-    fn test() {
-        let x = "String".to_string();
-        let y = std::sync::Arc::new(5);
-
-        fn no_arg(f: impl FnOnce()) {
-            f()
-        }
-
-        no_arg(with_clone!(x, move || {
-            drop(x);
-        }));
-
-        no_arg(with_clone!((x, y), move || {
-            drop(x);
-            drop(y);
-        }));
-
-        fn one_arg(f: impl FnOnce(usize)) {
-            f(1)
-        }
-
-        one_arg(with_clone!(x, move |_| {
-            drop(x);
-        }));
-        one_arg(with_clone!((x, y), move |b| {
-            drop(x);
-            drop(y);
-            println!("{}", b);
-        }));
-
-        fn two_arg(f: impl FnOnce(usize, bool)) {
-            f(5, true)
-        }
-
-        two_arg(with_clone!((x, y), move |a, b| {
-            drop(x);
-            drop(y);
-            println!("{}{}", a, b)
-        }));
-        two_arg(with_clone!((x, y), move |a, _| {
-            drop(x);
-            drop(y);
-            println!("{}", a)
-        }));
-        two_arg(with_clone!((x, y), move |_, b| {
-            drop(x);
-            drop(y);
-            println!("{}", b)
-        }));
-
-        struct Example {
-            z: usize,
-        }
-
-        fn destructuring_example(f: impl FnOnce(Example)) {
-            f(Example { z: 10 })
-        }
-
-        destructuring_example(with_clone!(x, move |Example { z }| {
-            drop(x);
-            println!("{}", z);
-        }));
-
-        let a_long_variable_1 = "".to_string();
-        let a_long_variable_2 = "".to_string();
-        let a_long_variable_3 = "".to_string();
-        let a_long_variable_4 = "".to_string();
-        two_arg(with_clone!(
-            (
-                x,
-                y,
-                a_long_variable_1,
-                a_long_variable_2,
-                a_long_variable_3,
-                a_long_variable_4
-            ),
-            move |a, b| {
-                drop(x);
-                drop(y);
-                drop(a_long_variable_1);
-                drop(a_long_variable_2);
-                drop(a_long_variable_3);
-                drop(a_long_variable_4);
-                println!("{}{}", a, b)
-            }
-        ));
-
-        fn single_expression_body(f: impl FnOnce(usize) -> usize) -> usize {
-            f(20)
-        }
-
-        let _result = single_expression_body(with_clone!(y, move |z| *y + z));
-
-        // Explicitly move all variables
-        drop(x);
-        drop(y);
-        drop(a_long_variable_1);
-        drop(a_long_variable_2);
-        drop(a_long_variable_3);
-        drop(a_long_variable_4);
-    }
-}
-
 pub fn truncate(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
         None => s,
@@ -183,10 +49,15 @@ pub fn truncate(s: &str, max_chars: usize) -> &str {
 pub fn truncate_and_trailoff(s: &str, max_chars: usize) -> String {
     debug_assert!(max_chars >= 5);
 
+    // If the string's byte length is <= max_chars, walking the string can be skipped since the
+    // number of chars is <= the number of bytes.
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
     let truncation_ix = s.char_indices().map(|(i, _)| i).nth(max_chars);
     match truncation_ix {
-        Some(length) => s[..length].to_string() + "…",
-        None => s.to_string(),
+        Some(index) => s[..index].to_string() + "…",
+        _ => s.to_string(),
     }
 }
 
@@ -195,10 +66,19 @@ pub fn truncate_and_trailoff(s: &str, max_chars: usize) -> String {
 pub fn truncate_and_remove_front(s: &str, max_chars: usize) -> String {
     debug_assert!(max_chars >= 5);
 
-    let truncation_ix = s.char_indices().map(|(i, _)| i).nth_back(max_chars);
+    // If the string's byte length is <= max_chars, walking the string can be skipped since the
+    // number of chars is <= the number of bytes.
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
+    let suffix_char_length = max_chars.saturating_sub(1);
+    let truncation_ix = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .nth_back(suffix_char_length);
     match truncation_ix {
-        Some(length) => "…".to_string() + &s[length..],
-        None => s.to_string(),
+        Some(index) if index > 0 => "…".to_string() + &s[index..],
+        _ => s.to_string(),
     }
 }
 
@@ -244,6 +124,128 @@ where
     }
 }
 
+pub fn truncate_to_bottom_n_sorted_by<T, F>(items: &mut Vec<T>, limit: usize, compare: &F)
+where
+    F: Fn(&T, &T) -> Ordering,
+{
+    if limit == 0 {
+        items.truncate(0);
+    }
+    if items.len() <= limit {
+        items.sort_by(compare);
+        return;
+    }
+    // When limit is near to items.len() it may be more efficient to sort the whole list and
+    // truncate, rather than always doing selection first as is done below. It's hard to analyze
+    // where the threshold for this should be since the quickselect style algorithm used by
+    // `select_nth_unstable_by` makes the prefix partially sorted, and so its work is not wasted -
+    // the expected number of comparisons needed by `sort_by` is less than it is for some arbitrary
+    // unsorted input.
+    items.select_nth_unstable_by(limit, compare);
+    items.truncate(limit);
+    items.sort_by(compare);
+}
+
+#[cfg(unix)]
+pub fn load_shell_from_passwd() -> Result<()> {
+    let buflen = match unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) } {
+        n if n < 0 => 1024,
+        n => n as usize,
+    };
+    let mut buffer = Vec::with_capacity(buflen);
+
+    let mut pwd: std::mem::MaybeUninit<libc::passwd> = std::mem::MaybeUninit::uninit();
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+
+    let uid = unsafe { libc::getuid() };
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            pwd.as_mut_ptr(),
+            buffer.as_mut_ptr() as *mut libc::c_char,
+            buflen,
+            &mut result,
+        )
+    };
+    let entry = unsafe { pwd.assume_init() };
+
+    anyhow::ensure!(
+        status == 0,
+        "call to getpwuid_r failed. uid: {}, status: {}",
+        uid,
+        status
+    );
+    anyhow::ensure!(!result.is_null(), "passwd entry for uid {} not found", uid);
+    anyhow::ensure!(
+        entry.pw_uid == uid,
+        "passwd entry has different uid ({}) than getuid ({}) returned",
+        entry.pw_uid,
+        uid,
+    );
+
+    let shell = unsafe { std::ffi::CStr::from_ptr(entry.pw_shell).to_str().unwrap() };
+    if env::var("SHELL").map_or(true, |shell_env| shell_env != shell) {
+        log::info!(
+            "updating SHELL environment variable to value from passwd entry: {:?}",
+            shell,
+        );
+        env::set_var("SHELL", shell);
+    }
+
+    Ok(())
+}
+
+pub fn load_login_shell_environment() -> Result<()> {
+    let marker = "ZED_LOGIN_SHELL_START";
+    let shell = env::var("SHELL").context(
+        "SHELL environment variable is not assigned so we can't source login environment variables",
+    )?;
+
+    // If possible, we want to `cd` in the user's `$HOME` to trigger programs
+    // such as direnv, asdf, mise, ... to adjust the PATH. These tools often hook
+    // into shell's `cd` command (and hooks) to manipulate env.
+    // We do this so that we get the env a user would have when spawning a shell
+    // in home directory.
+    let shell_cmd_prefix = std::env::var_os("HOME")
+        .and_then(|home| home.into_string().ok())
+        .map(|home| format!("cd '{home}';"));
+
+    // The `exit 0` is the result of hours of debugging, trying to find out
+    // why running this command here, without `exit 0`, would mess
+    // up signal process for our process so that `ctrl-c` doesn't work
+    // anymore.
+    // We still don't know why `$SHELL -l -i -c '/usr/bin/env -0'`  would
+    // do that, but it does, and `exit 0` helps.
+    let shell_cmd = format!(
+        "{}printf '%s' {marker}; /usr/bin/env; exit 0;",
+        shell_cmd_prefix.as_deref().unwrap_or("")
+    );
+
+    let output = std::process::Command::new(&shell)
+        .args(["-l", "-i", "-c", &shell_cmd])
+        .output()
+        .context("failed to spawn login shell to source login environment variables")?;
+    if !output.status.success() {
+        Err(anyhow!("login shell exited with error"))?;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    if let Some(env_output_start) = stdout.find(marker) {
+        let env_output = &stdout[env_output_start + marker.len()..];
+
+        parse_env_output(env_output, |key, value| env::set_var(key, value));
+
+        log::info!(
+            "set environment variables from shell:{}, path:{}",
+            shell,
+            env::var("PATH").unwrap_or_default(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Parse the result of calling `usr/bin/env` with no arguments
 pub fn parse_env_output(env: &str, mut f: impl FnMut(String, String)) {
     let mut current_key: Option<String> = None;
@@ -251,7 +253,7 @@ pub fn parse_env_output(env: &str, mut f: impl FnMut(String, String)) {
 
     for line in env.split_terminator('\n') {
         if let Some(separator_index) = line.find('=') {
-            if &line[..separator_index] != "" {
+            if !line[..separator_index].is_empty() {
                 if let Some((key, value)) = Option::zip(current_key.take(), current_value.take()) {
                     f(key, value)
                 }
@@ -281,6 +283,12 @@ pub fn merge_json_value_into(source: serde_json::Value, target: &mut serde_json:
                 } else {
                     target.insert(key.clone(), value);
                 }
+            }
+        }
+
+        (Value::Array(source), Value::Array(target)) => {
+            for value in source {
+                target.push(value);
             }
         }
 
@@ -328,6 +336,35 @@ pub fn measure<R>(label: &str, f: impl FnOnce() -> R) -> R {
     }
 }
 
+pub fn iterate_expanded_and_wrapped_usize_range(
+    range: Range<usize>,
+    additional_before: usize,
+    additional_after: usize,
+    wrap_length: usize,
+) -> impl Iterator<Item = usize> {
+    let start_wraps = range.start < additional_before;
+    let end_wraps = wrap_length < range.end + additional_after;
+    if start_wraps && end_wraps {
+        Either::Left(0..wrap_length)
+    } else if start_wraps {
+        let wrapped_start = (range.start + wrap_length).saturating_sub(additional_before);
+        if wrapped_start <= range.end {
+            Either::Left(0..wrap_length)
+        } else {
+            Either::Right((0..range.end + additional_after).chain(wrapped_start..wrap_length))
+        }
+    } else if end_wraps {
+        let wrapped_end = range.end + additional_after - wrap_length;
+        if range.start <= wrapped_end {
+            Either::Left(0..wrap_length)
+        } else {
+            Either::Right((0..wrapped_end).chain(range.start - additional_before..wrap_length))
+        }
+    } else {
+        Either::Left((range.start - additional_before)..(range.end + additional_after))
+    }
+}
+
 pub trait ResultExt<E> {
     type Ok;
 
@@ -335,6 +372,9 @@ pub trait ResultExt<E> {
     /// Assert that this result should never be an error in development or tests.
     fn debug_assert_ok(self, reason: &str) -> Self;
     fn warn_on_err(self) -> Option<Self::Ok>;
+    fn anyhow(self) -> anyhow::Result<Self::Ok>
+    where
+        E: Into<anyhow::Error>;
 }
 
 impl<T, E> ResultExt<E> for Result<T, E>
@@ -372,15 +412,26 @@ where
             }
         }
     }
+
+    fn anyhow(self) -> anyhow::Result<T>
+    where
+        E: Into<anyhow::Error>,
+    {
+        self.map_err(Into::into)
+    }
 }
 
 fn log_error_with_caller<E>(caller: core::panic::Location<'_>, error: E, level: log::Level)
 where
     E: std::fmt::Debug,
 {
+    #[cfg(not(target_os = "windows"))]
+    let file = caller.file();
+    #[cfg(target_os = "windows")]
+    let file = caller.file().replace('\\', "/");
     // In this codebase, the first segment of the file path is
     // the 'crates' folder, followed by the crate name.
-    let target = caller.file().split('/').nth(1);
+    let target = file.split('/').nth(1);
 
     log::logger().log(
         &log::Record::builder()
@@ -517,54 +568,59 @@ pub fn defer<F: FnOnce()>(f: F) -> Deferred<F> {
     Deferred(Some(f))
 }
 
-pub struct RandomCharIter<T: Rng> {
-    rng: T,
-    simple_text: bool,
-}
+#[cfg(any(test, feature = "test-support"))]
+mod rng {
+    use rand::{seq::SliceRandom, Rng};
+    pub struct RandomCharIter<T: Rng> {
+        rng: T,
+        simple_text: bool,
+    }
 
-impl<T: Rng> RandomCharIter<T> {
-    pub fn new(rng: T) -> Self {
-        Self {
-            rng,
-            simple_text: std::env::var("SIMPLE_TEXT").map_or(false, |v| !v.is_empty()),
+    impl<T: Rng> RandomCharIter<T> {
+        pub fn new(rng: T) -> Self {
+            Self {
+                rng,
+                simple_text: std::env::var("SIMPLE_TEXT").map_or(false, |v| !v.is_empty()),
+            }
+        }
+
+        pub fn with_simple_text(mut self) -> Self {
+            self.simple_text = true;
+            self
         }
     }
 
-    pub fn with_simple_text(mut self) -> Self {
-        self.simple_text = true;
-        self
-    }
-}
+    impl<T: Rng> Iterator for RandomCharIter<T> {
+        type Item = char;
 
-impl<T: Rng> Iterator for RandomCharIter<T> {
-    type Item = char;
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.simple_text {
+                return if self.rng.gen_range(0..100) < 5 {
+                    Some('\n')
+                } else {
+                    Some(self.rng.gen_range(b'a'..b'z' + 1).into())
+                };
+            }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.simple_text {
-            return if self.rng.gen_range(0..100) < 5 {
-                Some('\n')
-            } else {
-                Some(self.rng.gen_range(b'a'..b'z' + 1).into())
-            };
-        }
-
-        match self.rng.gen_range(0..100) {
-            // whitespace
-            0..=19 => [' ', '\n', '\r', '\t'].choose(&mut self.rng).copied(),
-            // two-byte greek letters
-            20..=32 => char::from_u32(self.rng.gen_range(('α' as u32)..('ω' as u32 + 1))),
-            // // three-byte characters
-            33..=45 => ['✋', '✅', '❌', '❎', '⭐']
-                .choose(&mut self.rng)
-                .copied(),
-            // // four-byte characters
-            46..=58 => ['🍐', '🏀', '🍗', '🎉'].choose(&mut self.rng).copied(),
-            // ascii letters
-            _ => Some(self.rng.gen_range(b'a'..b'z' + 1).into()),
+            match self.rng.gen_range(0..100) {
+                // whitespace
+                0..=19 => [' ', '\n', '\r', '\t'].choose(&mut self.rng).copied(),
+                // two-byte greek letters
+                20..=32 => char::from_u32(self.rng.gen_range(('α' as u32)..('ω' as u32 + 1))),
+                // // three-byte characters
+                33..=45 => ['✋', '✅', '❌', '❎', '⭐']
+                    .choose(&mut self.rng)
+                    .copied(),
+                // // four-byte characters
+                46..=58 => ['🍐', '🏀', '🍗', '🎉'].choose(&mut self.rng).copied(),
+                // ascii letters
+                _ => Some(self.rng.gen_range(b'a'..b'z' + 1).into()),
+            }
         }
     }
 }
-
+#[cfg(any(test, feature = "test-support"))]
+pub use rng::RandomCharIter;
 /// Get an embedded file as a string.
 pub fn asset_str<A: rust_embed::RustEmbed>(path: &str) -> Cow<'static, str> {
     match A::get(path).unwrap().data {
@@ -639,27 +695,34 @@ impl<T: Ord + Clone> RangeExt<T> for RangeInclusive<T> {
 /// This is useful for turning regular alphanumerically sorted sequences as `1-abc, 10, 11-def, .., 2, 21-abc`
 /// into `1-abc, 2, 10, 11-def, .., 21-abc`
 #[derive(Debug, PartialEq, Eq)]
-pub struct NumericPrefixWithSuffix<'a>(i32, &'a str);
+pub struct NumericPrefixWithSuffix<'a>(Option<u64>, &'a str);
 
 impl<'a> NumericPrefixWithSuffix<'a> {
-    pub fn from_numeric_prefixed_str(str: &'a str) -> Option<Self> {
+    pub fn from_numeric_prefixed_str(str: &'a str) -> Self {
         let i = str.chars().take_while(|c| c.is_ascii_digit()).count();
         let (prefix, remainder) = str.split_at(i);
 
-        match prefix.parse::<i32>() {
-            Ok(prefix) => Some(NumericPrefixWithSuffix(prefix, remainder)),
-            Err(_) => None,
-        }
+        let prefix = prefix.parse().ok();
+        Self(prefix, remainder)
     }
 }
 
+/// When dealing with equality, we need to consider the case of the strings to achieve strict equality
+/// to handle cases like "a" < "A" instead of "a" == "A".
 impl Ord for NumericPrefixWithSuffix<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
-        let NumericPrefixWithSuffix(num_a, remainder_a) = self;
-        let NumericPrefixWithSuffix(num_b, remainder_b) = other;
-        num_a
-            .cmp(num_b)
-            .then_with(|| UniCase::new(remainder_a).cmp(&UniCase::new(remainder_b)))
+        match (self.0, other.0) {
+            (None, None) => UniCase::new(self.1)
+                .cmp(&UniCase::new(other.1))
+                .then_with(|| self.1.cmp(other.1).reverse()),
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(a), Some(b)) => a.cmp(&b).then_with(|| {
+                UniCase::new(self.1)
+                    .cmp(&UniCase::new(other.1))
+                    .then_with(|| self.1.cmp(other.1).reverse())
+            }),
+        }
     }
 }
 
@@ -670,8 +733,9 @@ impl<'a> PartialOrd for NumericPrefixWithSuffix<'a> {
 }
 
 fn emoji_regex() -> &'static Regex {
-    static EMOJI_REGEX: OnceLock<Regex> = OnceLock::new();
-    EMOJI_REGEX.get_or_init(|| Regex::new("(\\p{Emoji}|\u{200D})").unwrap())
+    static EMOJI_REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new("(\\p{Emoji}|\u{200D})").unwrap());
+    &EMOJI_REGEX
 }
 
 /// Returns true if the given string consists of emojis only.
@@ -706,6 +770,29 @@ mod tests {
     }
 
     #[test]
+    fn test_truncate_to_bottom_n_sorted_by() {
+        let mut vec: Vec<u32> = vec![5, 2, 3, 4, 1];
+        truncate_to_bottom_n_sorted_by(&mut vec, 10, &u32::cmp);
+        assert_eq!(vec, &[1, 2, 3, 4, 5]);
+
+        vec = vec![5, 2, 3, 4, 1];
+        truncate_to_bottom_n_sorted_by(&mut vec, 5, &u32::cmp);
+        assert_eq!(vec, &[1, 2, 3, 4, 5]);
+
+        vec = vec![5, 2, 3, 4, 1];
+        truncate_to_bottom_n_sorted_by(&mut vec, 4, &u32::cmp);
+        assert_eq!(vec, &[1, 2, 3, 4]);
+
+        vec = vec![5, 2, 3, 4, 1];
+        truncate_to_bottom_n_sorted_by(&mut vec, 1, &u32::cmp);
+        assert_eq!(vec, &[1]);
+
+        vec = vec![5, 2, 3, 4, 1];
+        truncate_to_bottom_n_sorted_by(&mut vec, 0, &u32::cmp);
+        assert!(vec.is_empty());
+    }
+
+    #[test]
     fn test_iife() {
         fn option_returning_function() -> Option<()> {
             None
@@ -720,11 +807,25 @@ mod tests {
     }
 
     #[test]
-    fn test_trancate_and_trailoff() {
+    fn test_truncate_and_trailoff() {
         assert_eq!(truncate_and_trailoff("", 5), "");
+        assert_eq!(truncate_and_trailoff("aaaaaa", 7), "aaaaaa");
+        assert_eq!(truncate_and_trailoff("aaaaaa", 6), "aaaaaa");
+        assert_eq!(truncate_and_trailoff("aaaaaa", 5), "aaaaa…");
         assert_eq!(truncate_and_trailoff("èèèèèè", 7), "èèèèèè");
         assert_eq!(truncate_and_trailoff("èèèèèè", 6), "èèèèèè");
         assert_eq!(truncate_and_trailoff("èèèèèè", 5), "èèèèè…");
+    }
+
+    #[test]
+    fn test_truncate_and_remove_front() {
+        assert_eq!(truncate_and_remove_front("", 5), "");
+        assert_eq!(truncate_and_remove_front("aaaaaa", 7), "aaaaaa");
+        assert_eq!(truncate_and_remove_front("aaaaaa", 6), "aaaaaa");
+        assert_eq!(truncate_and_remove_front("aaaaaa", 5), "…aaaaa");
+        assert_eq!(truncate_and_remove_front("èèèèèè", 7), "èèèèèè");
+        assert_eq!(truncate_and_remove_front("èèèèèè", 6), "èèèèèè");
+        assert_eq!(truncate_and_remove_front("èèèèèè", 5), "…èèèèè");
     }
 
     #[test]
@@ -732,66 +833,62 @@ mod tests {
         let target = "1a";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(1, "a"))
+            NumericPrefixWithSuffix(Some(1), "a")
         );
 
         let target = "12ab";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(12, "ab"))
+            NumericPrefixWithSuffix(Some(12), "ab")
         );
 
         let target = "12_ab";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(12, "_ab"))
+            NumericPrefixWithSuffix(Some(12), "_ab")
         );
 
         let target = "1_2ab";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(1, "_2ab"))
+            NumericPrefixWithSuffix(Some(1), "_2ab")
         );
 
         let target = "1.2";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(1, ".2"))
+            NumericPrefixWithSuffix(Some(1), ".2")
         );
 
         let target = "1.2_a";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(1, ".2_a"))
+            NumericPrefixWithSuffix(Some(1), ".2_a")
         );
 
         let target = "12.2_a";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(12, ".2_a"))
+            NumericPrefixWithSuffix(Some(12), ".2_a")
         );
 
         let target = "12a.2_a";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(12, "a.2_a"))
+            NumericPrefixWithSuffix(Some(12), "a.2_a")
         );
     }
 
     #[test]
     fn test_numeric_prefix_with_suffix() {
         let mut sorted = vec!["1-abc", "10", "11def", "2", "21-abc"];
-        sorted.sort_by_key(|s| {
-            NumericPrefixWithSuffix::from_numeric_prefixed_str(s).unwrap_or_else(|| {
-                panic!("Cannot convert string `{s}` into NumericPrefixWithSuffix")
-            })
-        });
+        sorted.sort_by_key(|s| NumericPrefixWithSuffix::from_numeric_prefixed_str(s));
         assert_eq!(sorted, ["1-abc", "2", "10", "11def", "21-abc"]);
 
         for numeric_prefix_less in ["numeric_prefix_less", "aaa", "~™£"] {
             assert_eq!(
                 NumericPrefixWithSuffix::from_numeric_prefixed_str(numeric_prefix_less),
-                None,
+                NumericPrefixWithSuffix(None, numeric_prefix_less),
                 "String without numeric prefix `{numeric_prefix_less}` should not be converted into NumericPrefixWithSuffix"
             )
         }
@@ -838,6 +935,50 @@ Line 2
             r#"Line 1
 Line 2
 Line 3"#
+        );
+    }
+
+    #[test]
+    fn test_iterate_expanded_and_wrapped_usize_range() {
+        // Neither wrap
+        assert_eq!(
+            iterate_expanded_and_wrapped_usize_range(2..4, 1, 1, 8).collect::<Vec<usize>>(),
+            (1..5).collect::<Vec<usize>>()
+        );
+        // Start wraps
+        assert_eq!(
+            iterate_expanded_and_wrapped_usize_range(2..4, 3, 1, 8).collect::<Vec<usize>>(),
+            ((0..5).chain(7..8)).collect::<Vec<usize>>()
+        );
+        // Start wraps all the way around
+        assert_eq!(
+            iterate_expanded_and_wrapped_usize_range(2..4, 5, 1, 8).collect::<Vec<usize>>(),
+            (0..8).collect::<Vec<usize>>()
+        );
+        // Start wraps all the way around and past 0
+        assert_eq!(
+            iterate_expanded_and_wrapped_usize_range(2..4, 10, 1, 8).collect::<Vec<usize>>(),
+            (0..8).collect::<Vec<usize>>()
+        );
+        // End wraps
+        assert_eq!(
+            iterate_expanded_and_wrapped_usize_range(3..5, 1, 4, 8).collect::<Vec<usize>>(),
+            (0..1).chain(2..8).collect::<Vec<usize>>()
+        );
+        // End wraps all the way around
+        assert_eq!(
+            iterate_expanded_and_wrapped_usize_range(3..5, 1, 5, 8).collect::<Vec<usize>>(),
+            (0..8).collect::<Vec<usize>>()
+        );
+        // End wraps all the way around and past the end
+        assert_eq!(
+            iterate_expanded_and_wrapped_usize_range(3..5, 1, 10, 8).collect::<Vec<usize>>(),
+            (0..8).collect::<Vec<usize>>()
+        );
+        // Both start and end wrap
+        assert_eq!(
+            iterate_expanded_and_wrapped_usize_range(3..5, 4, 4, 8).collect::<Vec<usize>>(),
+            (0..8).collect::<Vec<usize>>()
         );
     }
 }

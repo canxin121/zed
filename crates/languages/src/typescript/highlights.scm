@@ -100,6 +100,7 @@
 ] @punctuation.delimiter
 
 [
+  "..."
   "-"
   "--"
   "-="
@@ -155,6 +156,13 @@
   "}"
 ]  @punctuation.bracket
 
+(ternary_expression
+  [
+    "?"
+    ":"
+  ] @operator
+)
+
 [
   "as"
   "async"
@@ -181,6 +189,7 @@
   "import"
   "in"
   "instanceof"
+  "is"
   "let"
   "new"
   "of"

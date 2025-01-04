@@ -89,15 +89,15 @@ impl ChannelModal {
         cx.notify()
     }
 
-    fn set_channel_visibility(&mut self, selection: &Selection, cx: &mut ViewContext<Self>) {
+    fn set_channel_visibility(&mut self, selection: &ToggleState, cx: &mut ViewContext<Self>) {
         self.channel_store.update(cx, |channel_store, cx| {
             channel_store
                 .set_channel_visibility(
                     self.channel_id,
                     match selection {
-                        Selection::Unselected => ChannelVisibility::Members,
-                        Selection::Selected => ChannelVisibility::Public,
-                        Selection::Indeterminate => return,
+                        ToggleState::Unselected => ChannelVisibility::Members,
+                        ToggleState::Selected => ChannelVisibility::Public,
+                        ToggleState::Indeterminate => return,
                     },
                     cx,
                 )
@@ -159,9 +159,9 @@ impl Render for ChannelModal {
                                 "is-public",
                                 Label::new("Public").size(LabelSize::Small),
                                 if visibility == ChannelVisibility::Public {
-                                    ui::Selection::Selected
+                                    ui::ToggleState::Selected
                                 } else {
-                                    ui::Selection::Unselected
+                                    ui::ToggleState::Unselected
                                 },
                                 cx.listener(Self::set_channel_visibility),
                             ))
@@ -175,7 +175,8 @@ impl Render for ChannelModal {
                                                 .read(cx)
                                                 .channel_for_id(channel_id)
                                             {
-                                                let item = ClipboardItem::new(channel.link(cx));
+                                                let item =
+                                                    ClipboardItem::new_string(channel.link(cx));
                                                 cx.write_to_clipboard(item);
                                             }
                                         })),
@@ -271,11 +272,7 @@ impl PickerDelegate for ChannelModalDelegate {
                     self.match_candidates.clear();
                     self.match_candidates
                         .extend(self.members.iter().enumerate().map(|(id, member)| {
-                            StringMatchCandidate {
-                                id,
-                                string: member.user.github_login.clone(),
-                                char_bag: member.user.github_login.chars().collect(),
-                            }
+                            StringMatchCandidate::new(id, &member.user.github_login)
                         }));
 
                     let matches = cx.background_executor().block(match_strings(
@@ -308,7 +305,7 @@ impl PickerDelegate for ChannelModalDelegate {
                             let members = search_members.await?;
                             picker.update(&mut cx, |picker, cx| {
                                 picker.delegate.has_all_members =
-                                    query == "" && members.len() < 100;
+                                    query.is_empty() && members.len() < 100;
                                 picker.delegate.matching_member_indices =
                                     (0..members.len()).collect();
                                 picker.delegate.members = members;
@@ -385,7 +382,7 @@ impl PickerDelegate for ChannelModalDelegate {
             ListItem::new(ix)
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
-                .selected(selected)
+                .toggle_state(selected)
                 .start_slot(Avatar::new(user.avatar_uri.clone()))
                 .child(Label::new(user.github_login.clone()))
                 .end_slot(h_flex().gap_2().map(|slot| {
@@ -412,7 +409,7 @@ impl PickerDelegate for ChannelModalDelegate {
                                     Some(
                                         deferred(
                                             anchored()
-                                                .anchor(gpui::AnchorCorner::TopRight)
+                                                .anchor(gpui::Corner::TopRight)
                                                 .child(menu.clone()),
                                         )
                                         .with_priority(1),

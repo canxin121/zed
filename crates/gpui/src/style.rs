@@ -5,10 +5,11 @@ use std::{
 };
 
 use crate::{
-    black, phi, point, quad, rems, AbsoluteLength, Bounds, ContentMask, Corners, CornersRefinement,
-    CursorStyle, DefiniteLength, Edges, EdgesRefinement, Font, FontFallbacks, FontFeatures,
-    FontStyle, FontWeight, Hsla, Length, Pixels, Point, PointRefinement, Rgba, SharedString, Size,
-    SizeRefinement, Styled, TextRun, WindowContext,
+    black, phi, point, quad, rems, size, AbsoluteLength, Background, BackgroundTag, Bounds,
+    ContentMask, Corners, CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges,
+    EdgesRefinement, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Hsla, Length,
+    Pixels, Point, PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun,
+    WindowContext,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -27,6 +28,119 @@ pub struct DebugBelow;
 #[cfg(debug_assertions)]
 impl crate::Global for DebugBelow {}
 
+/// How to fit the image into the bounds of the element.
+pub enum ObjectFit {
+    /// The image will be stretched to fill the bounds of the element.
+    Fill,
+    /// The image will be scaled to fit within the bounds of the element.
+    Contain,
+    /// The image will be scaled to cover the bounds of the element.
+    Cover,
+    /// The image will be scaled down to fit within the bounds of the element.
+    ScaleDown,
+    /// The image will maintain its original size.
+    None,
+}
+
+impl ObjectFit {
+    /// Get the bounds of the image within the given bounds.
+    pub fn get_bounds(
+        &self,
+        bounds: Bounds<Pixels>,
+        image_size: Size<DevicePixels>,
+    ) -> Bounds<Pixels> {
+        let image_size = image_size.map(|dimension| Pixels::from(u32::from(dimension)));
+        let image_ratio = image_size.width / image_size.height;
+        let bounds_ratio = bounds.size.width / bounds.size.height;
+
+        match self {
+            ObjectFit::Fill => bounds,
+            ObjectFit::Contain => {
+                let new_size = if bounds_ratio > image_ratio {
+                    size(
+                        image_size.width * (bounds.size.height / image_size.height),
+                        bounds.size.height,
+                    )
+                } else {
+                    size(
+                        bounds.size.width,
+                        image_size.height * (bounds.size.width / image_size.width),
+                    )
+                };
+
+                Bounds {
+                    origin: point(
+                        bounds.origin.x + (bounds.size.width - new_size.width) / 2.0,
+                        bounds.origin.y + (bounds.size.height - new_size.height) / 2.0,
+                    ),
+                    size: new_size,
+                }
+            }
+            ObjectFit::ScaleDown => {
+                // Check if the image is larger than the bounds in either dimension.
+                if image_size.width > bounds.size.width || image_size.height > bounds.size.height {
+                    // If the image is larger, use the same logic as Contain to scale it down.
+                    let new_size = if bounds_ratio > image_ratio {
+                        size(
+                            image_size.width * (bounds.size.height / image_size.height),
+                            bounds.size.height,
+                        )
+                    } else {
+                        size(
+                            bounds.size.width,
+                            image_size.height * (bounds.size.width / image_size.width),
+                        )
+                    };
+
+                    Bounds {
+                        origin: point(
+                            bounds.origin.x + (bounds.size.width - new_size.width) / 2.0,
+                            bounds.origin.y + (bounds.size.height - new_size.height) / 2.0,
+                        ),
+                        size: new_size,
+                    }
+                } else {
+                    // If the image is smaller than or equal to the container, display it at its original size,
+                    // centered within the container.
+                    let original_size = size(image_size.width, image_size.height);
+                    Bounds {
+                        origin: point(
+                            bounds.origin.x + (bounds.size.width - original_size.width) / 2.0,
+                            bounds.origin.y + (bounds.size.height - original_size.height) / 2.0,
+                        ),
+                        size: original_size,
+                    }
+                }
+            }
+            ObjectFit::Cover => {
+                let new_size = if bounds_ratio > image_ratio {
+                    size(
+                        bounds.size.width,
+                        image_size.height * (bounds.size.width / image_size.width),
+                    )
+                } else {
+                    size(
+                        image_size.width * (bounds.size.height / image_size.height),
+                        bounds.size.height,
+                    )
+                };
+
+                Bounds {
+                    origin: point(
+                        bounds.origin.x + (bounds.size.width - new_size.width) / 2.0,
+                        bounds.origin.y + (bounds.size.height - new_size.height) / 2.0,
+                    ),
+                    size: new_size,
+                }
+            }
+            ObjectFit::None => Bounds {
+                origin: bounds.origin,
+                size: image_size,
+            },
+        }
+    }
+}
+
 /// The CSS styling that can be applied to an element via the `Styled` trait
 #[derive(Clone, Refineable, Debug)]
 #[refineable(Debug)]
@@ -43,6 +157,8 @@ pub struct Style {
     pub overflow: Point<Overflow>,
     /// How much space (in points) should be reserved for the scrollbars of `Overflow::Scroll` and `Overflow::Auto` nodes.
     pub scrollbar_width: f32,
+    /// Whether both x and y axis should be scrollable at the same time.
+    pub allow_concurrent_scroll: bool,
 
     // Position properties
     /// What should the `position` value of this struct use as a base offset?
@@ -119,6 +235,9 @@ pub struct Style {
     /// The mouse cursor style shown when the mouse pointer is over an element.
     pub mouse_cursor: Option<CursorStyle>,
 
+    /// The opacity of this element
+    pub opacity: Option<f32>,
+
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
     pub debug: bool,
@@ -167,6 +286,16 @@ pub enum WhiteSpace {
     Nowrap,
 }
 
+/// How to truncate text that overflows the width of the element
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Truncate {
+    /// Truncate the text without an ellipsis
+    #[default]
+    Truncate,
+    /// Truncate the text with an ellipsis
+    Ellipsis,
+}
+
 /// The properties that can be used to style text in GPUI
 #[derive(Refineable, Clone, Debug, PartialEq)]
 #[refineable(Debug)]
@@ -206,6 +335,9 @@ pub struct TextStyle {
 
     /// How to handle whitespace in the text
     pub white_space: WhiteSpace,
+
+    /// The text should be truncated if it overflows the width of the element
+    pub truncate: Option<Truncate>,
 }
 
 impl Default for TextStyle {
@@ -213,7 +345,7 @@ impl Default for TextStyle {
         TextStyle {
             color: black(),
             // todo(linux) make this configurable or choose better default
-            font_family: if cfg!(target_os = "linux") {
+            font_family: if cfg!(any(target_os = "linux", target_os = "freebsd")) {
                 "FreeMono".into()
             } else if cfg!(target_os = "windows") {
                 "Segoe UI".into()
@@ -230,6 +362,7 @@ impl Default for TextStyle {
             underline: None,
             strikethrough: None,
             white_space: WhiteSpace::Normal,
+            truncate: None,
         }
     }
 }
@@ -376,7 +509,7 @@ impl Style {
             } => None,
             _ => {
                 let mut min = bounds.origin;
-                let mut max = bounds.lower_right();
+                let mut max = bounds.bottom_right();
 
                 if self
                     .border_color
@@ -397,12 +530,12 @@ impl Style {
                     // x visible, y hidden
                     (true, false) => Bounds::from_corners(
                         point(min.x, bounds.origin.y),
-                        point(max.x, bounds.lower_right().y),
+                        point(max.x, bounds.bottom_right().y),
                     ),
                     // x hidden, y visible
                     (false, true) => Bounds::from_corners(
                         point(bounds.origin.x, min.y),
-                        point(bounds.lower_right().x, max.y),
+                        point(bounds.bottom_right().x, max.y),
                     ),
                     // both hidden
                     (false, false) => Bounds::from_corners(min, max),
@@ -440,7 +573,17 @@ impl Style {
 
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.map_or(false, |color| !color.is_transparent()) {
-            let mut border_color = background_color.unwrap_or_default();
+            let mut border_color = match background_color {
+                Some(color) => match color.tag {
+                    BackgroundTag::Solid => color.solid,
+                    BackgroundTag::LinearGradient => color
+                        .colors
+                        .first()
+                        .map(|stop| stop.color)
+                        .unwrap_or_default(),
+                },
+                None => Hsla::default(),
+            };
             border_color.a = 0.;
             cx.paint_quad(quad(
                 bounds,
@@ -461,19 +604,19 @@ impl Style {
 
             let top_bounds = Bounds::from_corners(
                 bounds.origin,
-                bounds.upper_right() + point(Pixels::ZERO, max_border_width.max(max_corner_radius)),
+                bounds.top_right() + point(Pixels::ZERO, max_border_width.max(max_corner_radius)),
             );
             let bottom_bounds = Bounds::from_corners(
-                bounds.lower_left() - point(Pixels::ZERO, max_border_width.max(max_corner_radius)),
-                bounds.lower_right(),
+                bounds.bottom_left() - point(Pixels::ZERO, max_border_width.max(max_corner_radius)),
+                bounds.bottom_right(),
             );
             let left_bounds = Bounds::from_corners(
-                top_bounds.lower_left(),
+                top_bounds.bottom_left(),
                 bottom_bounds.origin + point(max_border_width, Pixels::ZERO),
             );
             let right_bounds = Bounds::from_corners(
-                top_bounds.lower_right() - point(max_border_width, Pixels::ZERO),
-                bottom_bounds.upper_right(),
+                top_bounds.bottom_right() - point(max_border_width, Pixels::ZERO),
+                bottom_bounds.top_right(),
             );
 
             let mut background = self.border_color.unwrap_or_default();
@@ -537,6 +680,7 @@ impl Default for Style {
                 x: Overflow::Visible,
                 y: Overflow::Visible,
             },
+            allow_concurrent_scroll: false,
             scrollbar_width: 0.0,
             position: Position::Relative,
             inset: Edges::auto(),
@@ -565,6 +709,7 @@ impl Default for Style {
             box_shadow: Default::default(),
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
+            opacity: None,
 
             #[cfg(debug_assertions)]
             debug: false,
@@ -603,12 +748,14 @@ pub struct StrikethroughStyle {
 #[derive(Clone, Debug)]
 pub enum Fill {
     /// A solid color fill.
-    Color(Hsla),
+    Color(Background),
 }
 
 impl Fill {
     /// Unwrap this fill into a solid color, if it is one.
-    pub fn color(&self) -> Option<Hsla> {
+    ///
+    /// If the fill is not a solid color, this method returns `None`.
+    pub fn color(&self) -> Option<Background> {
         match self {
             Fill::Color(color) => Some(*color),
         }
@@ -617,19 +764,25 @@ impl Fill {
 
 impl Default for Fill {
     fn default() -> Self {
-        Self::Color(Hsla::default())
+        Self::Color(Background::default())
     }
 }
 
 impl From<Hsla> for Fill {
     fn from(color: Hsla) -> Self {
-        Self::Color(color)
+        Self::Color(color.into())
     }
 }
 
 impl From<Rgba> for Fill {
     fn from(color: Rgba) -> Self {
         Self::Color(color.into())
+    }
+}
+
+impl From<Background> for Fill {
+    fn from(background: Background) -> Self {
+        Self::Color(background)
     }
 }
 

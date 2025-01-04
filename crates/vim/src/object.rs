@@ -1,25 +1,22 @@
 use std::ops::Range;
 
 use crate::{
-    motion::{coerce_punctuation, right},
-    normal::normal_object,
-    state::Mode,
-    visual::visual_object,
+    motion::right,
+    state::{Mode, Operator},
     Vim,
 };
 use editor::{
     display_map::{DisplaySnapshot, ToDisplayPoint},
     movement::{self, FindRange},
-    Bias, DisplayPoint,
+    Bias, DisplayPoint, Editor,
 };
 
 use itertools::Itertools;
 
-use gpui::{actions, impl_actions, ViewContext, WindowContext};
-use language::{char_kind, BufferSnapshot, CharKind, Point, Selection};
+use gpui::{actions, impl_actions, ViewContext};
+use language::{BufferSnapshot, CharKind, Point, Selection, TextObject, TreeSitterOptions};
 use multi_buffer::MultiBufferRow;
 use serde::Deserialize;
-use workspace::Workspace;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize)]
 pub enum Object {
@@ -35,7 +32,11 @@ pub enum Object {
     CurlyBrackets,
     AngleBrackets,
     Argument,
+    IndentObj { include_below: bool },
     Tag,
+    Method,
+    Class,
+    Comment,
 }
 
 #[derive(Clone, Deserialize, PartialEq)]
@@ -44,8 +45,14 @@ struct Word {
     #[serde(default)]
     ignore_punctuation: bool,
 }
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct IndentObj {
+    #[serde(default)]
+    include_below: bool,
+}
 
-impl_actions!(vim, [Word]);
+impl_actions!(vim, [Word, IndentObj]);
 
 actions!(
     vim,
@@ -61,52 +68,84 @@ actions!(
         CurlyBrackets,
         AngleBrackets,
         Argument,
-        Tag
+        Tag,
+        Method,
+        Class,
+        Comment
     ]
 );
 
-pub fn register(workspace: &mut Workspace, _: &mut ViewContext<Workspace>) {
-    workspace.register_action(
-        |_: &mut Workspace, &Word { ignore_punctuation }: &Word, cx: _| {
-            object(Object::Word { ignore_punctuation }, cx)
+pub fn register(editor: &mut Editor, cx: &mut ViewContext<Vim>) {
+    Vim::action(
+        editor,
+        cx,
+        |vim, &Word { ignore_punctuation }: &Word, cx| {
+            vim.object(Object::Word { ignore_punctuation }, cx)
         },
     );
-    workspace.register_action(|_: &mut Workspace, _: &Tag, cx: _| object(Object::Tag, cx));
-    workspace
-        .register_action(|_: &mut Workspace, _: &Sentence, cx: _| object(Object::Sentence, cx));
-    workspace
-        .register_action(|_: &mut Workspace, _: &Paragraph, cx: _| object(Object::Paragraph, cx));
-    workspace.register_action(|_: &mut Workspace, _: &Quotes, cx: _| object(Object::Quotes, cx));
-    workspace
-        .register_action(|_: &mut Workspace, _: &BackQuotes, cx: _| object(Object::BackQuotes, cx));
-    workspace.register_action(|_: &mut Workspace, _: &DoubleQuotes, cx: _| {
-        object(Object::DoubleQuotes, cx)
+    Vim::action(editor, cx, |vim, _: &Tag, cx| vim.object(Object::Tag, cx));
+    Vim::action(editor, cx, |vim, _: &Sentence, cx| {
+        vim.object(Object::Sentence, cx)
     });
-    workspace.register_action(|_: &mut Workspace, _: &Parentheses, cx: _| {
-        object(Object::Parentheses, cx)
+    Vim::action(editor, cx, |vim, _: &Paragraph, cx| {
+        vim.object(Object::Paragraph, cx)
     });
-    workspace.register_action(|_: &mut Workspace, _: &SquareBrackets, cx: _| {
-        object(Object::SquareBrackets, cx)
+    Vim::action(editor, cx, |vim, _: &Quotes, cx| {
+        vim.object(Object::Quotes, cx)
     });
-    workspace.register_action(|_: &mut Workspace, _: &CurlyBrackets, cx: _| {
-        object(Object::CurlyBrackets, cx)
+    Vim::action(editor, cx, |vim, _: &BackQuotes, cx| {
+        vim.object(Object::BackQuotes, cx)
     });
-    workspace.register_action(|_: &mut Workspace, _: &AngleBrackets, cx: _| {
-        object(Object::AngleBrackets, cx)
+    Vim::action(editor, cx, |vim, _: &DoubleQuotes, cx| {
+        vim.object(Object::DoubleQuotes, cx)
     });
-    workspace.register_action(|_: &mut Workspace, _: &VerticalBars, cx: _| {
-        object(Object::VerticalBars, cx)
+    Vim::action(editor, cx, |vim, _: &Parentheses, cx| {
+        vim.object(Object::Parentheses, cx)
     });
-    workspace
-        .register_action(|_: &mut Workspace, _: &Argument, cx: _| object(Object::Argument, cx));
+    Vim::action(editor, cx, |vim, _: &SquareBrackets, cx| {
+        vim.object(Object::SquareBrackets, cx)
+    });
+    Vim::action(editor, cx, |vim, _: &CurlyBrackets, cx| {
+        vim.object(Object::CurlyBrackets, cx)
+    });
+    Vim::action(editor, cx, |vim, _: &AngleBrackets, cx| {
+        vim.object(Object::AngleBrackets, cx)
+    });
+    Vim::action(editor, cx, |vim, _: &VerticalBars, cx| {
+        vim.object(Object::VerticalBars, cx)
+    });
+    Vim::action(editor, cx, |vim, _: &Argument, cx| {
+        vim.object(Object::Argument, cx)
+    });
+    Vim::action(editor, cx, |vim, _: &Method, cx| {
+        vim.object(Object::Method, cx)
+    });
+    Vim::action(editor, cx, |vim, _: &Class, cx| {
+        vim.object(Object::Class, cx)
+    });
+    Vim::action(editor, cx, |vim, _: &Comment, cx| {
+        if !matches!(vim.active_operator(), Some(Operator::Object { .. })) {
+            vim.push_operator(Operator::Object { around: true }, cx);
+        }
+        vim.object(Object::Comment, cx)
+    });
+    Vim::action(
+        editor,
+        cx,
+        |vim, &IndentObj { include_below }: &IndentObj, cx| {
+            vim.object(Object::IndentObj { include_below }, cx)
+        },
+    );
 }
 
-fn object(object: Object, cx: &mut WindowContext) {
-    match Vim::read(cx).state().mode {
-        Mode::Normal => normal_object(object, cx),
-        Mode::Visual | Mode::VisualLine | Mode::VisualBlock => visual_object(object, cx),
-        Mode::Insert | Mode::Replace => {
-            // Shouldn't execute a text object in insert mode. Ignoring
+impl Vim {
+    fn object(&mut self, object: Object, cx: &mut ViewContext<Self>) {
+        match self.mode {
+            Mode::Normal => self.normal_object(object, cx),
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => self.visual_object(object, cx),
+            Mode::Insert | Mode::Replace | Mode::HelixNormal => {
+                // Shouldn't execute a text object in insert mode. Ignoring
+            }
         }
     }
 }
@@ -126,13 +165,21 @@ impl Object {
             | Object::AngleBrackets
             | Object::CurlyBrackets
             | Object::SquareBrackets
-            | Object::Argument => true,
+            | Object::Argument
+            | Object::Method
+            | Object::Class
+            | Object::Comment
+            | Object::IndentObj { .. } => true,
         }
     }
 
     pub fn always_expands_both_ways(self) -> bool {
         match self {
-            Object::Word { .. } | Object::Sentence | Object::Paragraph | Object::Argument => false,
+            Object::Word { .. }
+            | Object::Sentence
+            | Object::Paragraph
+            | Object::Argument
+            | Object::IndentObj { .. } => false,
             Object::Quotes
             | Object::BackQuotes
             | Object::DoubleQuotes
@@ -140,12 +187,15 @@ impl Object {
             | Object::Parentheses
             | Object::SquareBrackets
             | Object::Tag
+            | Object::Method
+            | Object::Class
+            | Object::Comment
             | Object::CurlyBrackets
             | Object::AngleBrackets => true,
         }
     }
 
-    pub fn target_visual_mode(self, current_mode: Mode) -> Mode {
+    pub fn target_visual_mode(self, current_mode: Mode, around: bool) -> Mode {
         match self {
             Object::Word { .. }
             | Object::Sentence
@@ -164,7 +214,16 @@ impl Object {
             | Object::AngleBrackets
             | Object::VerticalBars
             | Object::Tag
-            | Object::Argument => Mode::Visual,
+            | Object::Comment
+            | Object::Argument
+            | Object::IndentObj { .. } => Mode::Visual,
+            Object::Method | Object::Class => {
+                if around {
+                    Mode::VisualLine
+                } else {
+                    Mode::Visual
+                }
+            }
             Object::Paragraph => Mode::VisualLine,
         }
     }
@@ -201,7 +260,11 @@ impl Object {
             Object::Parentheses => {
                 surrounding_markers(map, relative_to, around, self.is_multiline(), '(', ')')
             }
-            Object::Tag => surrounding_html_tag(map, selection, around),
+            Object::Tag => {
+                let head = selection.head();
+                let range = selection.range();
+                surrounding_html_tag(map, head, range, around)
+            }
             Object::SquareBrackets => {
                 surrounding_markers(map, relative_to, around, self.is_multiline(), '[', ']')
             }
@@ -211,7 +274,35 @@ impl Object {
             Object::AngleBrackets => {
                 surrounding_markers(map, relative_to, around, self.is_multiline(), '<', '>')
             }
+            Object::Method => text_object(
+                map,
+                relative_to,
+                if around {
+                    TextObject::AroundFunction
+                } else {
+                    TextObject::InsideFunction
+                },
+            ),
+            Object::Comment => text_object(
+                map,
+                relative_to,
+                if around {
+                    TextObject::AroundComment
+                } else {
+                    TextObject::InsideComment
+                },
+            ),
+            Object::Class => text_object(
+                map,
+                relative_to,
+                if around {
+                    TextObject::AroundClass
+                } else {
+                    TextObject::InsideClass
+                },
+            ),
             Object::Argument => argument(map, relative_to, around),
+            Object::IndentObj { include_below } => indent(map, relative_to, around, include_below),
         }
     }
 
@@ -241,30 +332,28 @@ fn in_word(
     ignore_punctuation: bool,
 ) -> Option<Range<DisplayPoint>> {
     // Use motion::right so that we consider the character under the cursor when looking for the start
-    let scope = map
+    let classifier = map
         .buffer_snapshot
-        .language_scope_at(relative_to.to_point(map));
+        .char_classifier_at(relative_to.to_point(map))
+        .ignore_punctuation(ignore_punctuation);
     let start = movement::find_preceding_boundary_display_point(
         map,
         right(map, relative_to, 1),
         movement::FindRange::SingleLine,
-        |left, right| {
-            coerce_punctuation(char_kind(&scope, left), ignore_punctuation)
-                != coerce_punctuation(char_kind(&scope, right), ignore_punctuation)
-        },
+        |left, right| classifier.kind(left) != classifier.kind(right),
     );
 
     let end = movement::find_boundary(map, relative_to, FindRange::SingleLine, |left, right| {
-        coerce_punctuation(char_kind(&scope, left), ignore_punctuation)
-            != coerce_punctuation(char_kind(&scope, right), ignore_punctuation)
+        classifier.kind(left) != classifier.kind(right)
     });
 
     Some(start..end)
 }
 
-fn surrounding_html_tag(
+pub fn surrounding_html_tag(
     map: &DisplaySnapshot,
-    selection: Selection<DisplayPoint>,
+    head: DisplayPoint,
+    range: Range<DisplayPoint>,
     around: bool,
 ) -> Option<Range<DisplayPoint>> {
     fn read_tag(chars: impl Iterator<Item = char>) -> String {
@@ -286,7 +375,7 @@ fn surrounding_html_tag(
     }
 
     let snapshot = &map.buffer_snapshot;
-    let offset = selection.head().to_offset(map, Bias::Left);
+    let offset = head.to_offset(map, Bias::Left);
     let excerpt = snapshot.excerpt_containing(offset..offset)?;
     let buffer = excerpt.buffer();
     let offset = excerpt.map_offset_to_buffer(offset);
@@ -307,14 +396,14 @@ fn surrounding_html_tag(
                 let open_tag = open_tag(buffer.chars_for_range(first_child.byte_range()));
                 let close_tag = close_tag(buffer.chars_for_range(last_child.byte_range()));
                 // It needs to be handled differently according to the selection length
-                let is_valid = if selection.end.to_offset(map, Bias::Left)
-                    - selection.start.to_offset(map, Bias::Left)
+                let is_valid = if range.end.to_offset(map, Bias::Left)
+                    - range.start.to_offset(map, Bias::Left)
                     <= 1
                 {
                     offset <= last_child.end_byte()
                 } else {
-                    selection.start.to_offset(map, Bias::Left) >= first_child.start_byte()
-                        && selection.end.to_offset(map, Bias::Left) <= last_child.start_byte() + 1
+                    range.start.to_offset(map, Bias::Left) >= first_child.start_byte()
+                        && range.end.to_offset(map, Bias::Left) <= last_child.start_byte() + 1
                 };
                 if open_tag.is_some() && open_tag == close_tag && is_valid {
                     let range = if around {
@@ -355,11 +444,14 @@ fn around_word(
     ignore_punctuation: bool,
 ) -> Option<Range<DisplayPoint>> {
     let offset = relative_to.to_offset(map, Bias::Left);
-    let scope = map.buffer_snapshot.language_scope_at(offset);
+    let classifier = map
+        .buffer_snapshot
+        .char_classifier_at(offset)
+        .ignore_punctuation(ignore_punctuation);
     let in_word = map
         .buffer_chars_at(offset)
         .next()
-        .map(|(c, _)| char_kind(&scope, c) != CharKind::Whitespace)
+        .map(|(c, _)| !classifier.is_whitespace(c))
         .unwrap_or(false);
 
     if in_word {
@@ -383,24 +475,22 @@ fn around_next_word(
     relative_to: DisplayPoint,
     ignore_punctuation: bool,
 ) -> Option<Range<DisplayPoint>> {
-    let scope = map
+    let classifier = map
         .buffer_snapshot
-        .language_scope_at(relative_to.to_point(map));
+        .char_classifier_at(relative_to.to_point(map))
+        .ignore_punctuation(ignore_punctuation);
     // Get the start of the word
     let start = movement::find_preceding_boundary_display_point(
         map,
         right(map, relative_to, 1),
         FindRange::SingleLine,
-        |left, right| {
-            coerce_punctuation(char_kind(&scope, left), ignore_punctuation)
-                != coerce_punctuation(char_kind(&scope, right), ignore_punctuation)
-        },
+        |left, right| classifier.kind(left) != classifier.kind(right),
     );
 
     let mut word_found = false;
     let end = movement::find_boundary(map, relative_to, FindRange::MultiLine, |left, right| {
-        let left_kind = coerce_punctuation(char_kind(&scope, left), ignore_punctuation);
-        let right_kind = coerce_punctuation(char_kind(&scope, right), ignore_punctuation);
+        let left_kind = classifier.kind(left);
+        let right_kind = classifier.kind(right);
 
         let found = (word_found && left_kind != right_kind) || right == '\n' && left == '\n';
 
@@ -412,6 +502,47 @@ fn around_next_word(
     });
 
     Some(start..end)
+}
+
+fn text_object(
+    map: &DisplaySnapshot,
+    relative_to: DisplayPoint,
+    target: TextObject,
+) -> Option<Range<DisplayPoint>> {
+    let snapshot = &map.buffer_snapshot;
+    let offset = relative_to.to_offset(map, Bias::Left);
+
+    let excerpt = snapshot.excerpt_containing(offset..offset)?;
+    let buffer = excerpt.buffer();
+
+    let mut matches: Vec<Range<usize>> = buffer
+        .text_object_ranges(offset..offset, TreeSitterOptions::default())
+        .filter_map(|(r, m)| if m == target { Some(r) } else { None })
+        .collect();
+    matches.sort_by_key(|r| (r.end - r.start));
+    if let Some(range) = matches.first() {
+        return Some(range.start.to_display_point(map)..range.end.to_display_point(map));
+    }
+
+    let around = target.around()?;
+    let mut matches: Vec<Range<usize>> = buffer
+        .text_object_ranges(offset..offset, TreeSitterOptions::default())
+        .filter_map(|(r, m)| if m == around { Some(r) } else { None })
+        .collect();
+    matches.sort_by_key(|r| (r.end - r.start));
+    let around_range = matches.first()?;
+
+    let mut matches: Vec<Range<usize>> = buffer
+        .text_object_ranges(around_range.clone(), TreeSitterOptions::default())
+        .filter_map(|(r, m)| if m == target { Some(r) } else { None })
+        .collect();
+    matches.sort_by_key(|r| r.start);
+    if let Some(range) = matches.first() {
+        if !range.is_empty() {
+            return Some(range.start.to_display_point(map)..range.end.to_display_point(map));
+        }
+    }
+    return Some(around_range.start.to_display_point(map)..around_range.end.to_display_point(map));
 }
 
 fn argument(
@@ -451,10 +582,10 @@ fn argument(
 
             // TODO: Is there any better way to filter out string brackets?
             // Used to filter out string brackets
-            return matches!(
+            matches!(
                 buffer.chars_at(open.start).next(),
                 Some('(' | '[' | '{' | '<' | '|')
-            );
+            )
         };
 
         // Find the brackets containing the cursor
@@ -480,9 +611,7 @@ fn argument(
             parent_covers_bracket_range = covers_bracket_range;
 
             // Unable to find a child node with a parent that covers the bracket range, so no argument to select
-            if cursor.goto_first_child_for_byte(offset).is_none() {
-                return None;
-            }
+            cursor.goto_first_child_for_byte(offset)?;
         }
 
         let mut argument_node = cursor.node();
@@ -563,6 +692,58 @@ fn argument(
     } else {
         None
     }
+}
+
+fn indent(
+    map: &DisplaySnapshot,
+    relative_to: DisplayPoint,
+    around: bool,
+    include_below: bool,
+) -> Option<Range<DisplayPoint>> {
+    let point = relative_to.to_point(map);
+    let row = point.row;
+
+    let desired_indent = map.line_indent_for_buffer_row(MultiBufferRow(row));
+
+    // Loop backwards until we find a non-blank line with less indent
+    let mut start_row = row;
+    for prev_row in (0..row).rev() {
+        let indent = map.line_indent_for_buffer_row(MultiBufferRow(prev_row));
+        if indent.is_line_empty() {
+            continue;
+        }
+        if indent.spaces < desired_indent.spaces || indent.tabs < desired_indent.tabs {
+            if around {
+                // When around is true, include the first line with less indent
+                start_row = prev_row;
+            }
+            break;
+        }
+        start_row = prev_row;
+    }
+
+    // Loop forwards until we find a non-blank line with less indent
+    let mut end_row = row;
+    let max_rows = map.buffer_snapshot.max_row().0;
+    for next_row in (row + 1)..=max_rows {
+        let indent = map.line_indent_for_buffer_row(MultiBufferRow(next_row));
+        if indent.is_line_empty() {
+            continue;
+        }
+        if indent.spaces < desired_indent.spaces || indent.tabs < desired_indent.tabs {
+            if around && include_below {
+                // When around is true and including below, include this line
+                end_row = next_row;
+            }
+            break;
+        }
+        end_row = next_row;
+    }
+
+    let end_len = map.buffer_snapshot.line_len(MultiBufferRow(end_row));
+    let start = map.point_to_display_point(Point::new(start_row, 0), Bias::Right);
+    let end = map.point_to_display_point(Point::new(end_row, end_len), Bias::Left);
+    Some(start..end)
 }
 
 fn sentence(
@@ -655,7 +836,7 @@ fn is_sentence_end(map: &DisplaySnapshot, offset: usize) -> bool {
         }
     }
 
-    return false;
+    false
 }
 
 /// Expands the passed range to include whitespace on one side or the other in a line. Attempts to add the
@@ -668,8 +849,8 @@ fn expand_to_include_whitespace(
     let mut range = range.start.to_offset(map, Bias::Left)..range.end.to_offset(map, Bias::Right);
     let mut whitespace_included = false;
 
-    let mut chars = map.buffer_chars_at(range.end).peekable();
-    while let Some((char, offset)) = chars.next() {
+    let chars = map.buffer_chars_at(range.end).peekable();
+    for (char, offset) in chars {
         if char == '\n' && stop_at_newline {
             break;
         }
@@ -739,11 +920,11 @@ fn paragraph(
             let paragraph_start_row = paragraph_start.row();
             if paragraph_start_row.0 != 0 {
                 let previous_paragraph_last_line_start =
-                    Point::new(paragraph_start_row.0 - 1, 0).to_display_point(map);
+                    DisplayPoint::new(paragraph_start_row - 1, 0);
                 paragraph_start = start_of_paragraph(map, previous_paragraph_last_line_start);
             }
         } else {
-            let next_paragraph_start = Point::new(paragraph_end_row.0 + 1, 0).to_display_point(map);
+            let next_paragraph_start = DisplayPoint::new(paragraph_end_row + 1, 0);
             paragraph_end = end_of_paragraph(map, next_paragraph_start);
         }
     }
@@ -777,13 +958,13 @@ pub fn start_of_paragraph(map: &DisplaySnapshot, display_point: DisplayPoint) ->
 /// The trailing newline is excluded from the paragraph.
 pub fn end_of_paragraph(map: &DisplaySnapshot, display_point: DisplayPoint) -> DisplayPoint {
     let point = display_point.to_point(map);
-    if point.row == map.max_buffer_row().0 {
+    if point.row == map.buffer_snapshot.max_row().0 {
         return map.max_point();
     }
 
     let is_current_line_blank = map.buffer_snapshot.is_line_blank(MultiBufferRow(point.row));
 
-    for row in point.row + 1..map.max_buffer_row().0 + 1 {
+    for row in point.row + 1..map.buffer_snapshot.max_row().0 + 1 {
         let blank = map.buffer_snapshot.is_line_blank(MultiBufferRow(row));
         if blank != is_current_line_blank {
             let previous_row = row - 1;
@@ -876,9 +1057,7 @@ fn surrounding_markers(
         }
     }
 
-    let Some(mut opening) = opening else {
-        return None;
-    };
+    let mut opening = opening?;
 
     let mut matched_opens = 0;
     let mut closing = None;
@@ -906,9 +1085,7 @@ fn surrounding_markers(
         before_ch = ch;
     }
 
-    let Some(mut closing) = closing else {
-        return None;
-    };
+    let mut closing = closing?;
 
     if around && !search_across_lines {
         let mut found = false;
@@ -1052,7 +1229,7 @@ mod test {
             .assert_matches();
     }
 
-    const PARAGRAPH_EXAMPLES: &[&'static str] = &[
+    const PARAGRAPH_EXAMPLES: &[&str] = &[
         // Single line
         "ˇThe quick brown fox jumpˇs over the lazy dogˇ.ˇ",
         // Multiple lines without empty lines
@@ -1139,7 +1316,7 @@ mod test {
     async fn test_visual_paragraph_object(cx: &mut gpui::TestAppContext) {
         let mut cx = NeovimBackedTestContext::new(cx).await;
 
-        const EXAMPLES: &[&'static str] = &[
+        const EXAMPLES: &[&str] = &[
             indoc! {"
                 ˇThe quick brown
                 fox jumps over
@@ -1456,6 +1633,94 @@ mod test {
         cx.set_state("let a = [test::callˇ(first_arg)]", Mode::Normal);
         cx.simulate_keystrokes("v i a");
         cx.assert_state("let a = [«test::call(first_arg)ˇ»]", Mode::Visual);
+    }
+
+    #[gpui::test]
+    async fn test_indent_object(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        // Base use case
+        cx.set_state(
+            indoc! {"
+                fn boop() {
+                    // Comment
+                    baz();ˇ
+
+                    loop {
+                        bar(1);
+                        bar(2);
+                    }
+
+                    result
+                }
+            "},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("v i i");
+        cx.assert_state(
+            indoc! {"
+                fn boop() {
+                «    // Comment
+                    baz();
+
+                    loop {
+                        bar(1);
+                        bar(2);
+                    }
+
+                    resultˇ»
+                }
+            "},
+            Mode::Visual,
+        );
+
+        // Around indent (include line above)
+        cx.set_state(
+            indoc! {"
+                const ABOVE: str = true;
+                fn boop() {
+
+                    hello();
+                    worˇld()
+                }
+            "},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("v a i");
+        cx.assert_state(
+            indoc! {"
+                const ABOVE: str = true;
+                «fn boop() {
+
+                    hello();
+                    world()ˇ»
+                }
+            "},
+            Mode::Visual,
+        );
+
+        // Around indent (include line above & below)
+        cx.set_state(
+            indoc! {"
+                const ABOVE: str = true;
+                fn boop() {
+                    hellˇo();
+                    world()
+
+                }
+                const BELOW: str = true;
+            "},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("c a shift-i");
+        cx.assert_state(
+            indoc! {"
+                const ABOVE: str = true;
+                ˇ
+                const BELOW: str = true;
+            "},
+            Mode::Insert,
+        );
     }
 
     #[gpui::test]

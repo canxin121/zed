@@ -16,18 +16,23 @@ doctest = false
 name = "cli"
 path = "src/main.rs"
 
+[features]
+no-bundled-uninstall = []
+default = []
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-ipc-channel = "0.18"
-once_cell.workspace = true
+collections.workspace = true
+ipc-channel = "0.19"
 parking_lot.workspace = true
 paths.workspace = true
 release_channel.workspace = true
 serde.workspace = true
 util.workspace = true
+tempfile.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 exec.workspace =  true
 fork.workspace = true
 

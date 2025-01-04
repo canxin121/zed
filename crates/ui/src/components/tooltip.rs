@@ -1,4 +1,6 @@
-use gpui::{Action, AnyView, IntoElement, Render, VisualContext};
+#![allow(missing_docs)]
+
+use gpui::{Action, AnyView, FocusHandle, IntoElement, Render, VisualContext};
 use settings::Settings;
 use theme::ThemeSettings;
 
@@ -34,6 +36,20 @@ impl Tooltip {
         .into()
     }
 
+    pub fn for_action_in(
+        title: impl Into<SharedString>,
+        action: &dyn Action,
+        focus_handle: &FocusHandle,
+        cx: &mut WindowContext,
+    ) -> AnyView {
+        cx.new_view(|cx| Self {
+            title: title.into(),
+            meta: None,
+            key_binding: KeyBinding::for_action_in(action, focus_handle, cx),
+        })
+        .into()
+    }
+
     pub fn with_meta(
         title: impl Into<SharedString>,
         action: Option<&dyn Action>,
@@ -44,6 +60,22 @@ impl Tooltip {
             title: title.into(),
             meta: Some(meta.into()),
             key_binding: action.and_then(|action| KeyBinding::for_action(action, cx)),
+        })
+        .into()
+    }
+
+    pub fn with_meta_in(
+        title: impl Into<SharedString>,
+        action: Option<&dyn Action>,
+        meta: impl Into<SharedString>,
+        focus_handle: &FocusHandle,
+        cx: &mut WindowContext,
+    ) -> AnyView {
+        cx.new_view(|cx| Self {
+            title: title.into(),
+            meta: Some(meta.into()),
+            key_binding: action
+                .and_then(|action| KeyBinding::for_action_in(action, focus_handle, cx)),
         })
         .into()
     }
@@ -73,7 +105,7 @@ impl Render for Tooltip {
             el.child(
                 h_flex()
                     .gap_4()
-                    .child(self.title.clone())
+                    .child(div().max_w_72().child(self.title.clone()))
                     .when_some(self.key_binding.clone(), |this, key_binding| {
                         this.justify_between().child(key_binding)
                     }),

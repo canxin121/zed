@@ -2,7 +2,7 @@
 //! features (the other big contributors being project and lsp crates that revolve around LSP features).
 //! Namely, this crate:
 //! - Provides [`Language`], [`Grammar`] and [`LanguageRegistry`] types that
-//! use Tree-sitter to provide syntax highlighting to the editor; note though that `language` doesn't perform the highlighting by itself. It only maps ranges in a buffer to colors. Treesitter is also used for buffer outlines (lists of symbols in a buffer)
+//!   use Tree-sitter to provide syntax highlighting to the editor; note though that `language` doesn't perform the highlighting by itself. It only maps ranges in a buffer to colors. Treesitter is also used for buffer outlines (lists of symbols in a buffer)
 //! - Exposes [`LanguageConfig`] that describes how constructs (like brackets or line comments) should be handled by the editor for a source file of a particular language.
 //!
 //! Notably we do *not* assign a single language to a single file; in real world a single file can consist of multiple programming languages - HTML is a good example of that - and `language` crate tends to reflect that status quo in its API.
@@ -15,9 +15,10 @@ mod outline;
 pub mod proto;
 mod syntax_map;
 mod task_context;
+mod toolchain;
 
 #[cfg(test)]
-mod buffer_tests;
+pub mod buffer_tests;
 pub mod markdown;
 
 use crate::language_settings::SoftWrap;
@@ -28,8 +29,11 @@ use futures::Future;
 use gpui::{AppContext, AsyncAppContext, Model, SharedString, Task};
 pub use highlight_map::HighlightMap;
 use http_client::HttpClient;
-use lazy_static::lazy_static;
-use lsp::{CodeActionKind, LanguageServerBinary};
+pub use language_registry::{LanguageName, LoadedLanguage};
+use lsp::{
+    CodeActionKind, InitializeParams, LanguageServerBinary, LanguageServerBinaryOptions,
+    LanguageServerName,
+};
 use parking_lot::Mutex;
 use regex::Regex;
 use schemars::{
@@ -39,6 +43,7 @@ use schemars::{
 };
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use settings::WorktreeId;
 use smol::future::FutureExt as _;
 use std::num::NonZeroU32;
 use std::{
@@ -53,13 +58,14 @@ use std::{
     str,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
-        Arc,
+        Arc, LazyLock,
     },
 };
 use syntax_map::{QueryCursorHandle, SyntaxSnapshot};
 use task::RunnableTag;
 pub use task_context::{ContextProvider, RunnableRange};
 use theme::SyntaxTheme;
+pub use toolchain::{LanguageToolchainStore, Toolchain, ToolchainList, ToolchainLister};
 use tree_sitter::{self, wasmtime, Query, QueryCursor, WasmStore};
 use util::serde::default_true;
 
@@ -67,12 +73,12 @@ pub use buffer::Operation;
 pub use buffer::*;
 pub use diagnostic_set::DiagnosticEntry;
 pub use language_registry::{
-    LanguageNotFound, LanguageQueries, LanguageRegistry, LanguageServerBinaryStatus,
-    PendingLanguageServer, QUERY_FILENAME_PREFIXES,
+    AvailableLanguage, LanguageNotFound, LanguageQueries, LanguageRegistry,
+    LanguageServerBinaryStatus, QUERY_FILENAME_PREFIXES,
 };
 pub use lsp::LanguageServerId;
-pub use outline::{render_item, Outline, OutlineItem};
-pub use syntax_map::{OwnedSyntaxLayer, SyntaxLayer};
+pub use outline::*;
+pub use syntax_map::{OwnedSyntaxLayer, SyntaxLayer, ToTreeSitterPoint, TreeSitterOptions};
 pub use text::{AnchorRangeExt, LineEnding};
 pub use tree_sitter::{Node, Parser, Tree, TreeCursor};
 
@@ -93,7 +99,7 @@ where
     let mut parser = PARSERS.lock().pop().unwrap_or_else(|| {
         let mut parser = Parser::new();
         parser
-            .set_wasm_store(WasmStore::new(WASM_ENGINE.clone()).unwrap())
+            .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
             .unwrap();
         parser
     });
@@ -111,23 +117,27 @@ where
     func(cursor.deref_mut())
 }
 
-lazy_static! {
-    static ref NEXT_LANGUAGE_ID: AtomicUsize = Default::default();
-    static ref NEXT_GRAMMAR_ID: AtomicUsize = Default::default();
-    static ref WASM_ENGINE: wasmtime::Engine = {
-        wasmtime::Engine::new(&wasmtime::Config::new()).unwrap()
-    };
+static NEXT_LANGUAGE_ID: LazyLock<AtomicUsize> = LazyLock::new(Default::default);
+static NEXT_GRAMMAR_ID: LazyLock<AtomicUsize> = LazyLock::new(Default::default);
+static WASM_ENGINE: LazyLock<wasmtime::Engine> = LazyLock::new(|| {
+    wasmtime::Engine::new(&wasmtime::Config::new()).expect("Failed to create Wasmtime engine")
+});
 
-    /// A shared grammar for plain text, exposed for reuse by downstream crates.
-    pub static ref PLAIN_TEXT: Arc<Language> = Arc::new(Language::new(
+/// A shared grammar for plain text, exposed for reuse by downstream crates.
+pub static PLAIN_TEXT: LazyLock<Arc<Language>> = LazyLock::new(|| {
+    Arc::new(Language::new(
         LanguageConfig {
             name: "Plain Text".into(),
             soft_wrap: Some(SoftWrap::EditorWidth),
+            matcher: LanguageMatcher {
+                path_suffixes: vec!["txt".to_owned()],
+                first_line_pattern: None,
+            },
             ..Default::default()
         },
         None,
-    ));
-}
+    ))
+});
 
 /// Types that represent a position in a buffer, and can be converted into
 /// an LSP position, to send to a language server.
@@ -135,10 +145,6 @@ pub trait ToLspPosition {
     /// Converts the value into an LSP position.
     fn to_lsp_position(self) -> lsp::Position;
 }
-
-/// A name of a language server.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
-pub struct LanguageServerName(pub Arc<str>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Location {
@@ -156,15 +162,29 @@ pub struct CachedLspAdapter {
     language_ids: HashMap<String, String>,
     pub adapter: Arc<dyn LspAdapter>,
     pub reinstall_attempt_count: AtomicU64,
-    /// Indicates whether this language server is the primary language server
-    /// for a given language. Currently, most LSP-backed features only work
-    /// with one language server, so one server needs to be primary.
-    pub is_primary: bool,
     cached_binary: futures::lock::Mutex<Option<LanguageServerBinary>>,
 }
 
+impl Debug for CachedLspAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedLspAdapter")
+            .field("name", &self.name)
+            .field(
+                "disk_based_diagnostic_sources",
+                &self.disk_based_diagnostic_sources,
+            )
+            .field(
+                "disk_based_diagnostics_progress_token",
+                &self.disk_based_diagnostics_progress_token,
+            )
+            .field("language_ids", &self.language_ids)
+            .field("reinstall_attempt_count", &self.reinstall_attempt_count)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CachedLspAdapter {
-    pub fn new(adapter: Arc<dyn LspAdapter>, is_primary: bool) -> Arc<Self> {
+    pub fn new(adapter: Arc<dyn LspAdapter>) -> Arc<Self> {
         let name = adapter.name();
         let disk_based_diagnostic_sources = adapter.disk_based_diagnostic_sources();
         let disk_based_diagnostics_progress_token = adapter.disk_based_diagnostics_progress_token();
@@ -176,43 +196,27 @@ impl CachedLspAdapter {
             disk_based_diagnostics_progress_token,
             language_ids,
             adapter,
-            is_primary,
             cached_binary: Default::default(),
             reinstall_attempt_count: AtomicU64::new(0),
         })
     }
 
+    pub fn name(&self) -> LanguageServerName {
+        self.adapter.name().clone()
+    }
+
     pub async fn get_language_server_command(
         self: Arc<Self>,
-        language: Arc<Language>,
-        container_dir: Arc<Path>,
         delegate: Arc<dyn LspAdapterDelegate>,
+        toolchains: Arc<dyn LanguageToolchainStore>,
+        binary_options: LanguageServerBinaryOptions,
         cx: &mut AsyncAppContext,
     ) -> Result<LanguageServerBinary> {
         let cached_binary = self.cached_binary.lock().await;
         self.adapter
             .clone()
-            .get_language_server_command(language, container_dir, delegate, cached_binary, cx)
+            .get_language_server_command(delegate, toolchains, binary_options, cached_binary, cx)
             .await
-    }
-
-    pub fn will_start_server(
-        &self,
-        delegate: &Arc<dyn LspAdapterDelegate>,
-        cx: &mut AsyncAppContext,
-    ) -> Option<Task<Result<()>>> {
-        self.adapter.will_start_server(delegate, cx)
-    }
-
-    pub fn can_be_reinstalled(&self) -> bool {
-        self.adapter.can_be_reinstalled()
-    }
-
-    pub async fn installation_test_binary(
-        &self,
-        container_dir: PathBuf,
-    ) -> Option<LanguageServerBinary> {
-        self.adapter.installation_test_binary(container_dir).await
     }
 
     pub fn code_action_kinds(&self) -> Option<Vec<CodeActionKind>> {
@@ -249,16 +253,11 @@ impl CachedLspAdapter {
             .await
     }
 
-    pub fn language_id(&self, language: &Language) -> String {
+    pub fn language_id(&self, language_name: &LanguageName) -> String {
         self.language_ids
-            .get(language.name().as_ref())
+            .get(language_name.0.as_ref())
             .cloned()
-            .unwrap_or_else(|| language.lsp_id())
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn as_fake(&self) -> Option<&FakeLspAdapter> {
-        self.adapter.as_fake()
+            .unwrap_or_else(|| language_name.lsp_id())
     }
 }
 
@@ -268,13 +267,19 @@ impl CachedLspAdapter {
 pub trait LspAdapterDelegate: Send + Sync {
     fn show_notification(&self, message: &str, cx: &mut AppContext);
     fn http_client(&self) -> Arc<dyn HttpClient>;
-    fn worktree_id(&self) -> u64;
+    fn worktree_id(&self) -> WorktreeId;
     fn worktree_root_path(&self) -> &Path;
     fn update_status(&self, language: LanguageServerName, status: LanguageServerBinaryStatus);
+    async fn language_server_download_dir(&self, name: &LanguageServerName) -> Option<Arc<Path>>;
 
+    async fn npm_package_installed_version(
+        &self,
+        package_name: &str,
+    ) -> Result<Option<(PathBuf, String)>>;
     async fn which(&self, command: &OsStr) -> Option<PathBuf>;
     async fn shell_env(&self) -> HashMap<String, String>;
     async fn read_text_file(&self, path: PathBuf) -> Result<String>;
+    async fn try_exec(&self, binary: LanguageServerBinary) -> Result<()>;
 }
 
 #[async_trait(?Send)]
@@ -283,9 +288,9 @@ pub trait LspAdapter: 'static + Send + Sync {
 
     fn get_language_server_command<'a>(
         self: Arc<Self>,
-        language: Arc<Language>,
-        container_dir: Arc<Path>,
         delegate: Arc<dyn LspAdapterDelegate>,
+        toolchains: Arc<dyn LanguageToolchainStore>,
+        binary_options: LanguageServerBinaryOptions,
         mut cached_binary: futures::lock::MutexGuard<'a, Option<LanguageServerBinary>>,
         cx: &'a mut AsyncAppContext,
     ) -> Pin<Box<dyn 'a + Future<Output = Result<LanguageServerBinary>>>> {
@@ -301,25 +306,29 @@ pub trait LspAdapter: 'static + Send + Sync {
             // We only want to cache when we fall back to the global one,
             // because we don't want to download and overwrite our global one
             // for each worktree we might have open.
-            if let Some(binary) = self.check_if_user_installed(delegate.as_ref(), cx).await {
-                log::info!(
-                    "found user-installed language server for {}. path: {:?}, arguments: {:?}",
-                    language.name(),
-                    binary.path,
-                    binary.arguments
-                );
-                return Ok(binary);
+            if binary_options.allow_path_lookup {
+                if let Some(binary) = self.check_if_user_installed(delegate.as_ref(), toolchains, cx).await {
+                    log::info!(
+                        "found user-installed language server for {}. path: {:?}, arguments: {:?}",
+                        self.name().0,
+                        binary.path,
+                        binary.arguments
+                    );
+                    return Ok(binary);
+                }
+            }
+
+            if !binary_options.allow_binary_download {
+                return Err(anyhow!("downloading language servers disabled"));
             }
 
             if let Some(cached_binary) = cached_binary.as_ref() {
                 return Ok(cached_binary.clone());
             }
 
-            if !container_dir.exists() {
-                smol::fs::create_dir_all(&container_dir)
-                    .await
-                    .context("failed to create container directory")?;
-            }
+            let Some(container_dir) = delegate.language_server_download_dir(&self.name()).await else {
+                anyhow::bail!("no language server download dir defined")
+            };
 
             let mut binary = try_fetch_server_binary(self.as_ref(), &delegate, container_dir.to_path_buf(), cx).await;
 
@@ -329,8 +338,9 @@ pub trait LspAdapter: 'static + Send + Sync {
                     .await
                 {
                     log::info!(
-                        "failed to fetch newest version of language server {:?}. falling back to using {:?}",
+                        "failed to fetch newest version of language server {:?}. error: {:?}, falling back to using {:?}",
                         self.name(),
+                        error,
                         prev_downloaded_binary.path
                     );
                     binary = Ok(prev_downloaded_binary);
@@ -356,6 +366,7 @@ pub trait LspAdapter: 'static + Send + Sync {
     async fn check_if_user_installed(
         &self,
         _: &dyn LspAdapterDelegate,
+        _: Arc<dyn LanguageToolchainStore>,
         _: &AsyncAppContext,
     ) -> Option<LanguageServerBinary> {
         None
@@ -374,11 +385,12 @@ pub trait LspAdapter: 'static + Send + Sync {
         None
     }
 
-    fn will_start_server(
+    async fn check_if_version_installed(
         &self,
-        _: &Arc<dyn LspAdapterDelegate>,
-        _: &mut AsyncAppContext,
-    ) -> Option<Task<Result<()>>> {
+        _version: &(dyn 'static + Send + Any),
+        _container_dir: &PathBuf,
+        _delegate: &dyn LspAdapterDelegate,
+    ) -> Option<LanguageServerBinary> {
         None
     }
 
@@ -395,21 +407,6 @@ pub trait LspAdapter: 'static + Send + Sync {
         delegate: &dyn LspAdapterDelegate,
     ) -> Option<LanguageServerBinary>;
 
-    /// Returns `true` if a language server can be reinstalled.
-    ///
-    /// If language server initialization fails, a reinstallation will be attempted unless the value returned from this method is `false`.
-    ///
-    /// Implementations that rely on software already installed on user's system
-    /// should have [`can_be_reinstalled`](Self::can_be_reinstalled) return `false`.
-    fn can_be_reinstalled(&self) -> bool {
-        true
-    }
-
-    async fn installation_test_binary(
-        &self,
-        container_dir: PathBuf,
-    ) -> Option<LanguageServerBinary>;
-
     fn process_diagnostics(&self, _: &mut lsp::PublishDiagnosticsParams) {}
 
     /// Post-processes completions provided by the language server.
@@ -421,7 +418,7 @@ pub trait LspAdapter: 'static + Send + Sync {
         language: &Arc<Language>,
     ) -> Result<Vec<Option<CodeLabel>>> {
         let mut labels = Vec::new();
-        for (ix, completion) in completions.into_iter().enumerate() {
+        for (ix, completion) in completions.iter().enumerate() {
             let label = self.label_for_completion(completion, language).await;
             if let Some(label) = label {
                 labels.resize(ix + 1, None);
@@ -445,7 +442,7 @@ pub trait LspAdapter: 'static + Send + Sync {
         language: &Arc<Language>,
     ) -> Result<Vec<Option<CodeLabel>>> {
         let mut labels = Vec::new();
-        for (ix, (name, kind)) in symbols.into_iter().enumerate() {
+        for (ix, (name, kind)) in symbols.iter().enumerate() {
             let label = self.label_for_symbol(name, *kind, language).await;
             if let Some(label) = label {
                 labels.resize(ix + 1, None);
@@ -475,6 +472,7 @@ pub trait LspAdapter: 'static + Send + Sync {
     async fn workspace_configuration(
         self: Arc<Self>,
         _: &Arc<dyn LspAdapterDelegate>,
+        _: Arc<dyn LanguageToolchainStore>,
         _cx: &mut AsyncAppContext,
     ) -> Result<Value> {
         Ok(serde_json::json!({}))
@@ -503,9 +501,9 @@ pub trait LspAdapter: 'static + Send + Sync {
         Default::default()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    fn as_fake(&self) -> Option<&FakeLspAdapter> {
-        None
+    /// Support custom initialize params.
+    fn prepare_initialize_params(&self, original: InitializeParams) -> Result<InitializeParams> {
+        Ok(original)
     }
 }
 
@@ -522,18 +520,28 @@ async fn try_fetch_server_binary<L: LspAdapter + 'static + Send + Sync + ?Sized>
     let name = adapter.name();
     log::info!("fetching latest version of language server {:?}", name.0);
     delegate.update_status(name.clone(), LanguageServerBinaryStatus::CheckingForUpdate);
+
     let latest_version = adapter
         .fetch_latest_server_version(delegate.as_ref())
         .await?;
 
-    log::info!("downloading language server {:?}", name.0);
-    delegate.update_status(adapter.name(), LanguageServerBinaryStatus::Downloading);
-    let binary = adapter
-        .fetch_server_binary(latest_version, container_dir, delegate.as_ref())
-        .await;
+    if let Some(binary) = adapter
+        .check_if_version_installed(latest_version.as_ref(), &container_dir, delegate.as_ref())
+        .await
+    {
+        log::info!("language server {:?} is already installed", name.0);
+        delegate.update_status(name.clone(), LanguageServerBinaryStatus::None);
+        Ok(binary)
+    } else {
+        log::info!("downloading language server {:?}", name.0);
+        delegate.update_status(adapter.name(), LanguageServerBinaryStatus::Downloading);
+        let binary = adapter
+            .fetch_server_binary(latest_version, container_dir, delegate.as_ref())
+            .await;
 
-    delegate.update_status(name.clone(), LanguageServerBinaryStatus::None);
-    binary
+        delegate.update_status(name.clone(), LanguageServerBinaryStatus::None);
+        binary
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -549,7 +557,7 @@ pub struct CodeLabel {
 #[derive(Clone, Deserialize, JsonSchema)]
 pub struct LanguageConfig {
     /// Human-readable name of the language.
-    pub name: Arc<str>,
+    pub name: LanguageName,
     /// The name of this language for a Markdown code fence block
     pub code_fence_block_name: Option<Arc<str>>,
     // The name of the grammar in a WASM bundle (experimental).
@@ -565,6 +573,9 @@ pub struct LanguageConfig {
     /// the indentation level for a new line.
     #[serde(default = "auto_indent_using_last_non_empty_line_default")]
     pub auto_indent_using_last_non_empty_line: bool,
+    // Whether indentation of pasted content should be adjusted based on the context.
+    #[serde(default)]
+    pub auto_indent_on_paste: Option<bool>,
     /// A regex that is used to determine whether the indentation level should be
     /// increased in the following line.
     #[serde(default, deserialize_with = "deserialize_regex")]
@@ -593,7 +604,7 @@ pub struct LanguageConfig {
     pub block_comment: Option<(Arc<str>, Arc<str>)>,
     /// A list of language servers that are allowed to run on subranges of a given language.
     #[serde(default)]
-    pub scope_opt_in_language_servers: Vec<String>,
+    pub scope_opt_in_language_servers: Vec<LanguageServerName>,
     #[serde(default)]
     pub overrides: HashMap<String, LanguageConfigOverride>,
     /// A list of characters that Zed should treat as word characters for the
@@ -615,6 +626,10 @@ pub struct LanguageConfig {
     /// If there's a parser name in the language settings, that will be used instead.
     #[serde(default)]
     pub prettier_parser_name: Option<String>,
+    /// If true, this language is only for syntax highlighting via an injection into other
+    /// languages, but should not appear to the user as a distinct language.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, JsonSchema)]
@@ -653,7 +668,7 @@ pub struct LanguageConfigOverride {
     #[serde(default)]
     pub word_characters: Override<HashSet<char>>,
     #[serde(default)]
-    pub opt_into_language_servers: Vec<String>,
+    pub opt_into_language_servers: Vec<LanguageServerName>,
 }
 
 #[derive(Clone, Deserialize, Debug, Serialize, JsonSchema)]
@@ -682,12 +697,13 @@ impl<T> Override<T> {
 impl Default for LanguageConfig {
     fn default() -> Self {
         Self {
-            name: Arc::default(),
+            name: LanguageName::new(""),
             code_fence_block_name: None,
             grammar: None,
             matcher: LanguageMatcher::default(),
             brackets: Default::default(),
             auto_indent_using_last_non_empty_line: auto_indent_using_last_non_empty_line_default(),
+            auto_indent_on_paste: None,
             increase_indent_pattern: Default::default(),
             decrease_indent_pattern: Default::default(),
             autoclose_before: Default::default(),
@@ -701,6 +717,7 @@ impl Default for LanguageConfig {
             tab_size: None,
             soft_wrap: None,
             prettier_parser_name: None,
+            hidden: false,
         }
     }
 }
@@ -740,12 +757,13 @@ where
 pub struct FakeLspAdapter {
     pub name: &'static str,
     pub initialization_options: Option<Value>,
-    pub capabilities: lsp::ServerCapabilities,
-    pub initializer: Option<Box<dyn 'static + Send + Sync + Fn(&mut lsp::FakeLanguageServer)>>,
+    pub prettier_plugins: Vec<&'static str>,
     pub disk_based_diagnostics_progress_token: Option<String>,
     pub disk_based_diagnostics_sources: Vec<String>,
-    pub prettier_plugins: Vec<&'static str>,
     pub language_server_binary: LanguageServerBinary,
+
+    pub capabilities: lsp::ServerCapabilities,
+    pub initializer: Option<Box<dyn 'static + Send + Sync + Fn(&mut lsp::FakeLanguageServer)>>,
 }
 
 /// Configuration of handling bracket pairs for a given language.
@@ -826,6 +844,7 @@ pub struct Language {
     pub(crate) config: LanguageConfig,
     pub(crate) grammar: Option<Arc<Grammar>>,
     pub(crate) context_provider: Option<Arc<dyn ContextProvider>>,
+    pub(crate) toolchain: Option<Arc<dyn ToolchainLister>>,
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
@@ -847,6 +866,7 @@ pub struct Grammar {
     pub(crate) runnable_config: Option<RunnableConfig>,
     pub(crate) indents_config: Option<IndentConfig>,
     pub outline_config: Option<OutlineConfig>,
+    pub text_object_config: Option<TextObjectConfig>,
     pub embedding_config: Option<EmbeddingConfig>,
     pub(crate) injection_config: Option<InjectionConfig>,
     pub(crate) override_config: Option<OverrideConfig>,
@@ -869,6 +889,45 @@ pub struct OutlineConfig {
     pub extra_context_capture_ix: Option<u32>,
     pub open_capture_ix: Option<u32>,
     pub close_capture_ix: Option<u32>,
+    pub annotation_capture_ix: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TextObject {
+    InsideFunction,
+    AroundFunction,
+    InsideClass,
+    AroundClass,
+    InsideComment,
+    AroundComment,
+}
+
+impl TextObject {
+    pub fn from_capture_name(name: &str) -> Option<TextObject> {
+        match name {
+            "function.inside" => Some(TextObject::InsideFunction),
+            "function.around" => Some(TextObject::AroundFunction),
+            "class.inside" => Some(TextObject::InsideClass),
+            "class.around" => Some(TextObject::AroundClass),
+            "comment.inside" => Some(TextObject::InsideComment),
+            "comment.around" => Some(TextObject::AroundComment),
+            _ => None,
+        }
+    }
+
+    pub fn around(&self) -> Option<Self> {
+        match self {
+            TextObject::InsideFunction => Some(TextObject::AroundFunction),
+            TextObject::InsideClass => Some(TextObject::AroundClass),
+            TextObject::InsideComment => Some(TextObject::AroundComment),
+            _ => None,
+        }
+    }
+}
+
+pub struct TextObjectConfig {
+    pub query: Query,
+    pub text_objects_by_capture_ix: Vec<(u32, TextObject)>,
 }
 
 #[derive(Debug)]
@@ -907,7 +966,14 @@ struct RunnableConfig {
 
 struct OverrideConfig {
     query: Query,
-    values: HashMap<u32, (String, LanguageConfigOverride)>,
+    values: HashMap<u32, OverrideEntry>,
+}
+
+#[derive(Debug)]
+struct OverrideEntry {
+    name: String,
+    range_is_inclusive: bool,
+    value: LanguageConfigOverride,
 }
 
 #[derive(Default, Clone)]
@@ -941,6 +1007,7 @@ impl Language {
                     highlights_query: None,
                     brackets_config: None,
                     outline_config: None,
+                    text_object_config: None,
                     embedding_config: None,
                     indents_config: None,
                     injection_config: None,
@@ -953,11 +1020,17 @@ impl Language {
                 })
             }),
             context_provider: None,
+            toolchain: None,
         }
     }
 
     pub fn with_context_provider(mut self, provider: Option<Arc<dyn ContextProvider>>) -> Self {
         self.context_provider = provider;
+        self
+    }
+
+    pub fn with_toolchain_lister(mut self, provider: Option<Arc<dyn ToolchainLister>>) -> Self {
+        self.toolchain = provider;
         self
     }
 
@@ -1005,7 +1078,12 @@ impl Language {
         if let Some(query) = queries.runnables {
             self = self
                 .with_runnable_query(query.as_ref())
-                .context("Error loading tests query")?;
+                .context("Error loading runnables query")?;
+        }
+        if let Some(query) = queries.text_objects {
+            self = self
+                .with_text_object_query(query.as_ref())
+                .context("Error loading textobject query")?;
         }
         Ok(self)
     }
@@ -1054,6 +1132,7 @@ impl Language {
         let mut extra_context_capture_ix = None;
         let mut open_capture_ix = None;
         let mut close_capture_ix = None;
+        let mut annotation_capture_ix = None;
         get_capture_indices(
             &query,
             &mut [
@@ -1063,6 +1142,7 @@ impl Language {
                 ("context.extra", &mut extra_context_capture_ix),
                 ("open", &mut open_capture_ix),
                 ("close", &mut close_capture_ix),
+                ("annotation", &mut annotation_capture_ix),
             ],
         );
         if let Some((item_capture_ix, name_capture_ix)) = item_capture_ix.zip(name_capture_ix) {
@@ -1074,8 +1154,29 @@ impl Language {
                 extra_context_capture_ix,
                 open_capture_ix,
                 close_capture_ix,
+                annotation_capture_ix,
             });
         }
+        Ok(self)
+    }
+
+    pub fn with_text_object_query(mut self, source: &str) -> Result<Self> {
+        let grammar = self
+            .grammar_mut()
+            .ok_or_else(|| anyhow!("cannot mutate grammar"))?;
+        let query = Query::new(&grammar.ts_language, source)?;
+
+        let mut text_objects_by_capture_ix = Vec::new();
+        for (ix, name) in query.capture_names().iter().enumerate() {
+            if let Some(text_object) = TextObject::from_capture_name(name) {
+                text_objects_by_capture_ix.push((ix as u32, text_object));
+            }
+        }
+
+        grammar.text_object_config = Some(TextObjectConfig {
+            query,
+            text_objects_by_capture_ix,
+        });
         Ok(self)
     }
 
@@ -1218,58 +1319,66 @@ impl Language {
         };
 
         let mut override_configs_by_id = HashMap::default();
-        for (ix, name) in query.capture_names().iter().enumerate() {
-            if !name.starts_with('_') {
-                let value = self.config.overrides.remove(*name).unwrap_or_default();
-                for server_name in &value.opt_into_language_servers {
-                    if !self
-                        .config
-                        .scope_opt_in_language_servers
-                        .contains(server_name)
-                    {
-                        util::debug_panic!("Server {server_name:?} has been opted-in by scope {name:?} but has not been marked as an opt-in server");
-                    }
-                }
-
-                override_configs_by_id.insert(ix as u32, (name.to_string(), value));
+        for (ix, mut name) in query.capture_names().iter().copied().enumerate() {
+            let mut range_is_inclusive = false;
+            if name.starts_with('_') {
+                continue;
             }
+            if let Some(prefix) = name.strip_suffix(".inclusive") {
+                name = prefix;
+                range_is_inclusive = true;
+            }
+
+            let value = self.config.overrides.get(name).cloned().unwrap_or_default();
+            for server_name in &value.opt_into_language_servers {
+                if !self
+                    .config
+                    .scope_opt_in_language_servers
+                    .contains(server_name)
+                {
+                    util::debug_panic!("Server {server_name:?} has been opted-in by scope {name:?} but has not been marked as an opt-in server");
+                }
+            }
+
+            override_configs_by_id.insert(
+                ix as u32,
+                OverrideEntry {
+                    name: name.to_string(),
+                    range_is_inclusive,
+                    value,
+                },
+            );
         }
 
-        if !self.config.overrides.is_empty() {
-            let keys = self.config.overrides.keys().collect::<Vec<_>>();
-            Err(anyhow!(
-                "language {:?} has overrides in config not in query: {keys:?}",
-                self.config.name
-            ))?;
-        }
+        let referenced_override_names = self.config.overrides.keys().chain(
+            self.config
+                .brackets
+                .disabled_scopes_by_bracket_ix
+                .iter()
+                .flatten(),
+        );
 
-        for disabled_scope_name in self
-            .config
-            .brackets
-            .disabled_scopes_by_bracket_ix
-            .iter()
-            .flatten()
-        {
+        for referenced_name in referenced_override_names {
             if !override_configs_by_id
                 .values()
-                .any(|(scope_name, _)| scope_name == disabled_scope_name)
+                .any(|entry| entry.name == *referenced_name)
             {
                 Err(anyhow!(
-                    "language {:?} has overrides in config not in query: {disabled_scope_name:?}",
+                    "language {:?} has overrides in config not in query: {referenced_name:?}",
                     self.config.name
                 ))?;
             }
         }
 
-        for (name, override_config) in override_configs_by_id.values_mut() {
-            override_config.disabled_bracket_ixs = self
+        for entry in override_configs_by_id.values_mut() {
+            entry.value.disabled_bracket_ixs = self
                 .config
                 .brackets
                 .disabled_scopes_by_bracket_ix
                 .iter()
                 .enumerate()
                 .filter_map(|(ix, disabled_scope_names)| {
-                    if disabled_scope_names.contains(name) {
+                    if disabled_scope_names.contains(&entry.name) {
                         Some(ix as u16)
                     } else {
                         None
@@ -1313,7 +1422,7 @@ impl Language {
         Arc::get_mut(self.grammar.as_mut()?)
     }
 
-    pub fn name(&self) -> Arc<str> {
+    pub fn name(&self) -> LanguageName {
         self.config.name.clone()
     }
 
@@ -1321,11 +1430,15 @@ impl Language {
         self.config
             .code_fence_block_name
             .clone()
-            .unwrap_or_else(|| self.config.name.to_lowercase().into())
+            .unwrap_or_else(|| self.config.name.0.to_lowercase().into())
     }
 
     pub fn context_provider(&self) -> Option<Arc<dyn ContextProvider>> {
         self.context_provider.clone()
+    }
+
+    pub fn toolchain_lister(&self) -> Option<Arc<dyn ToolchainLister>> {
+        self.toolchain.clone()
     }
 
     pub fn highlight_text<'a>(
@@ -1342,7 +1455,9 @@ impl Language {
                 });
             let highlight_maps = vec![grammar.highlight_map()];
             let mut offset = 0;
-            for chunk in BufferChunks::new(text, range, Some((captures, highlight_maps)), vec![]) {
+            for chunk in
+                BufferChunks::new(text, range, Some((captures, highlight_maps)), false, None)
+            {
                 let end_offset = offset + chunk.text.len();
                 if let Some(highlight_id) = chunk.syntax_highlight_id {
                     if !highlight_id.is_default() {
@@ -1384,18 +1499,27 @@ impl Language {
     }
 
     pub fn lsp_id(&self) -> String {
-        match self.config.name.as_ref() {
-            "Plain Text" => "plaintext".to_string(),
-            language_name => language_name.to_lowercase(),
-        }
+        self.config.name.lsp_id()
     }
 
     pub fn prettier_parser_name(&self) -> Option<&str> {
         self.config.prettier_parser_name.as_deref()
     }
+
+    pub fn config(&self) -> &LanguageConfig {
+        &self.config
+    }
 }
 
 impl LanguageScope {
+    pub fn path_suffixes(&self) -> &[String] {
+        &self.language.path_suffixes()
+    }
+
+    pub fn language_name(&self) -> LanguageName {
+        self.language.config.name.clone()
+    }
+
     pub fn collapsed_placeholder(&self) -> &str {
         self.language.config.collapsed_placeholder.as_ref()
     }
@@ -1461,9 +1585,9 @@ impl LanguageScope {
     pub fn language_allowed(&self, name: &LanguageServerName) -> bool {
         let config = &self.language.config;
         let opt_in_servers = &config.scope_opt_in_language_servers;
-        if opt_in_servers.iter().any(|o| *o == *name.0) {
+        if opt_in_servers.iter().any(|o| *o == *name) {
             if let Some(over) = self.config_override() {
-                over.opt_into_language_servers.iter().any(|o| *o == *name.0)
+                over.opt_into_language_servers.iter().any(|o| *o == *name)
             } else {
                 false
             }
@@ -1472,11 +1596,18 @@ impl LanguageScope {
         }
     }
 
+    pub fn override_name(&self) -> Option<&str> {
+        let id = self.override_id?;
+        let grammar = self.language.grammar.as_ref()?;
+        let override_config = grammar.override_config.as_ref()?;
+        override_config.values.get(&id).map(|e| e.name.as_str())
+    }
+
     fn config_override(&self) -> Option<&LanguageConfigOverride> {
         let id = self.override_id?;
         let grammar = self.language.grammar.as_ref()?;
         let override_config = grammar.override_config.as_ref()?;
-        override_config.values.get(&id).map(|e| &e.1)
+        override_config.values.get(&id).map(|e| &e.value)
     }
 }
 
@@ -1561,6 +1692,26 @@ impl CodeLabel {
             self.runs.push((start_ix..end_ix, highlight));
         }
     }
+
+    pub fn text(&self) -> &str {
+        self.text.as_str()
+    }
+
+    pub fn filter_text(&self) -> &str {
+        &self.text[self.filter_range.clone()]
+    }
+}
+
+impl From<String> for CodeLabel {
+    fn from(value: String) -> Self {
+        Self::plain(value, None)
+    }
+}
+
+impl From<&str> for CodeLabel {
+    fn from(value: &str) -> Self {
+        Self::plain(value.to_string(), None)
+    }
 }
 
 impl Ord for LanguageMatcher {
@@ -1617,11 +1768,20 @@ impl LspAdapter for FakeLspAdapter {
         LanguageServerName(self.name.into())
     }
 
+    async fn check_if_user_installed(
+        &self,
+        _: &dyn LspAdapterDelegate,
+        _: Arc<dyn LanguageToolchainStore>,
+        _: &AsyncAppContext,
+    ) -> Option<LanguageServerBinary> {
+        Some(self.language_server_binary.clone())
+    }
+
     fn get_language_server_command<'a>(
         self: Arc<Self>,
-        _: Arc<Language>,
-        _: Arc<Path>,
         _: Arc<dyn LspAdapterDelegate>,
+        _: Arc<dyn LanguageToolchainStore>,
+        _: LanguageServerBinaryOptions,
         _: futures::lock::MutexGuard<'a, Option<LanguageServerBinary>>,
         _: &'a mut AsyncAppContext,
     ) -> Pin<Box<dyn 'a + Future<Output = Result<LanguageServerBinary>>>> {
@@ -1652,10 +1812,6 @@ impl LspAdapter for FakeLspAdapter {
         unreachable!();
     }
 
-    async fn installation_test_binary(&self, _: PathBuf) -> Option<LanguageServerBinary> {
-        unreachable!();
-    }
-
     fn process_diagnostics(&self, _: &mut lsp::PublishDiagnosticsParams) {}
 
     fn disk_based_diagnostic_sources(&self) -> Vec<String> {
@@ -1671,10 +1827,6 @@ impl LspAdapter for FakeLspAdapter {
         _: &Arc<dyn LspAdapterDelegate>,
     ) -> Result<Option<Value>> {
         Ok(self.initialization_options.clone())
-    }
-
-    fn as_fake(&self) -> Option<&FakeLspAdapter> {
-        Some(self)
     }
 }
 
@@ -1723,8 +1875,8 @@ mod tests {
         let languages = LanguageRegistry::test(cx.executor());
         let languages = Arc::new(languages);
         languages.register_native_grammars([
-            ("json", tree_sitter_json::language()),
-            ("rust", tree_sitter_rust::language()),
+            ("json", tree_sitter_json::LANGUAGE),
+            ("rust", tree_sitter_rust::LANGUAGE),
         ]);
         languages.register_test_language(LanguageConfig {
             name: "JSON".into(),

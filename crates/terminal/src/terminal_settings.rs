@@ -1,15 +1,13 @@
+use alacritty_terminal::vte::ansi::{
+    CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle,
+};
 use collections::HashMap;
 use gpui::{
     px, AbsoluteLength, AppContext, FontFallbacks, FontFeatures, FontWeight, Pixels, SharedString,
 };
-use schemars::{
-    gen::SchemaGenerator,
-    schema::{ArrayValidation, InstanceType, RootSchema, Schema, SchemaObject},
-    JsonSchema,
-};
+use schemars::{gen::SchemaGenerator, schema::RootSchema, JsonSchema};
 use serde_derive::{Deserialize, Serialize};
-use serde_json::Value;
-use settings::{SettingsJsonSchemaParams, SettingsSources};
+use settings::{add_references_to_properties, SettingsJsonSchemaParams, SettingsSources};
 use std::path::PathBuf;
 use task::Shell;
 
@@ -23,10 +21,10 @@ pub enum TerminalDockPosition {
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct Toolbar {
-    pub title: bool,
+    pub breadcrumbs: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct TerminalSettings {
     pub shell: Shell,
     pub working_directory: WorkingDirectory,
@@ -37,6 +35,7 @@ pub struct TerminalSettings {
     pub font_weight: Option<FontWeight>,
     pub line_height: TerminalLineHeight,
     pub env: HashMap<String, String>,
+    pub cursor_shape: Option<CursorShape>,
     pub blinking: TerminalBlink,
     pub alternate_scroll: AlternateScroll,
     pub option_as_meta: bool,
@@ -92,6 +91,7 @@ pub enum ActivateScript {
     Csh,
     Fish,
     Nushell,
+    PowerShell,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -133,6 +133,11 @@ pub struct TerminalSettingsContent {
     ///
     /// Default: {}
     pub env: Option<HashMap<String, String>>,
+    /// Default cursor shape for the terminal.
+    /// Can be "bar", "block", "underline", or "hollow".
+    ///
+    /// Default: None
+    pub cursor_shape: Option<CursorShape>,
     /// Sets the cursor blinking behavior in the terminal.
     ///
     /// Default: terminal_controlled
@@ -202,51 +207,18 @@ impl settings::Settings for TerminalSettings {
         _: &AppContext,
     ) -> RootSchema {
         let mut root_schema = generator.root_schema_for::<Self::FileContent>();
-        let available_fonts: Vec<_> = params
-            .font_names
-            .iter()
-            .cloned()
-            .map(Value::String)
-            .collect();
-
-        let font_family_schema = SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            enum_values: Some(available_fonts),
-            ..Default::default()
-        };
-
-        let font_fallback_schema = SchemaObject {
-            instance_type: Some(InstanceType::Array.into()),
-            array: Some(Box::new(ArrayValidation {
-                items: Some(schemars::schema::SingleOrVec::Single(Box::new(
-                    font_family_schema.clone().into(),
-                ))),
-                unique_items: Some(true),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-
         root_schema.definitions.extend([
-            ("FontFamilies".into(), font_family_schema.into()),
-            ("FontFallbacks".into(), font_fallback_schema.into()),
+            ("FontFamilies".into(), params.font_family_schema()),
+            ("FontFallbacks".into(), params.font_fallback_schema()),
         ]);
-        root_schema
-            .schema
-            .object
-            .as_mut()
-            .unwrap()
-            .properties
-            .extend([
-                (
-                    "font_family".to_owned(),
-                    Schema::new_ref("#/definitions/FontFamilies".into()),
-                ),
-                (
-                    "font_fallbacks".to_owned(),
-                    Schema::new_ref("#/definitions/FontFallbacks".into()),
-                ),
-            ]);
+
+        add_references_to_properties(
+            &mut root_schema,
+            &[
+                ("font_family", "#/definitions/FontFamilies"),
+                ("font_fallbacks", "#/definitions/FontFallbacks"),
+            ],
+        );
 
         root_schema
     }
@@ -314,8 +286,46 @@ pub enum WorkingDirectory {
 // Toolbar related settings
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ToolbarContent {
-    /// Whether to display the terminal title in its toolbar.
+    /// Whether to display the terminal title in breadcrumbs inside the terminal pane.
+    /// Only shown if the terminal title is not empty.
+    ///
+    /// The shell running in the terminal needs to be configured to emit the title.
+    /// Example: `echo -e "\e]2;New Title\007";`
     ///
     /// Default: true
-    pub title: Option<bool>,
+    pub breadcrumbs: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorShape {
+    /// Cursor is a block like `█`.
+    #[default]
+    Block,
+    /// Cursor is an underscore like `_`.
+    Underline,
+    /// Cursor is a vertical bar like `⎸`.
+    Bar,
+    /// Cursor is a hollow box like `▯`.
+    Hollow,
+}
+
+impl From<CursorShape> for AlacCursorShape {
+    fn from(value: CursorShape) -> Self {
+        match value {
+            CursorShape::Block => AlacCursorShape::Block,
+            CursorShape::Underline => AlacCursorShape::Underline,
+            CursorShape::Bar => AlacCursorShape::Beam,
+            CursorShape::Hollow => AlacCursorShape::HollowBlock,
+        }
+    }
+}
+
+impl From<CursorShape> for AlacCursorStyle {
+    fn from(value: CursorShape) -> Self {
+        AlacCursorStyle {
+            shape: value.into(),
+            blinking: false,
+        }
+    }
 }

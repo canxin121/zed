@@ -195,7 +195,9 @@ pub fn render_markdown_mut(
     let mut current_language = None;
     let mut list_stack = Vec::new();
 
-    let options = Options::all();
+    let mut options = Options::all();
+    options.remove(pulldown_cmark::Options::ENABLE_DEFINITION_LIST);
+
     for (event, source_range) in Parser::new_ext(block, options).into_offset_iter() {
         let prev_len = text.len();
         match event {
@@ -308,12 +310,7 @@ pub fn render_markdown_mut(
             }
             Event::Start(tag) => match tag {
                 Tag::Paragraph => new_paragraph(text, &mut list_stack),
-                Tag::Heading {
-                    level: _,
-                    id: _,
-                    classes: _,
-                    attrs: _,
-                } => {
+                Tag::Heading { .. } => {
                     new_paragraph(text, &mut list_stack);
                     bold_depth += 1;
                 }
@@ -331,12 +328,7 @@ pub fn render_markdown_mut(
                 Tag::Emphasis => italic_depth += 1,
                 Tag::Strong => bold_depth += 1,
                 Tag::Strikethrough => strikethrough_depth += 1,
-                Tag::Link {
-                    link_type: _,
-                    dest_url,
-                    title: _,
-                    id: _,
-                } => link_url = Some(dest_url.to_string()),
+                Tag::Link { dest_url, .. } => link_url = Some(dest_url.to_string()),
                 Tag::List(number) => {
                     list_stack.push((number, false));
                 }

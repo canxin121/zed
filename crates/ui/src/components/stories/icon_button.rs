@@ -1,5 +1,5 @@
 use gpui::Render;
-use story::{StoryContainer, StoryItem, StorySection};
+use story::{Story, StoryItem, StorySection};
 
 use crate::{prelude::*, IconButtonShape, Tooltip};
 use crate::{IconButton, IconName};
@@ -21,7 +21,7 @@ impl Render for IconButtonStory {
 
         let selected_button = StoryItem::new(
             "Selected",
-            IconButton::new("selected_icon_button", IconName::Hash).selected(true),
+            IconButton::new("selected_icon_button", IconName::Hash).toggle_state(true),
         )
         .description("Displays an icon button that is selected.")
         .usage(
@@ -33,7 +33,7 @@ impl Render for IconButtonStory {
         let selected_with_selected_icon = StoryItem::new(
             "Selected with `selected_icon`",
             IconButton::new("selected_with_selected_icon_button", IconName::AudioOn)
-                .selected(true)
+                .toggle_state(true)
                 .selected_icon(IconName::AudioOff),
         )
         .description(
@@ -89,7 +89,7 @@ impl Render for IconButtonStory {
         let selected_with_tooltip_button = StoryItem::new(
             "Selected with `tooltip`",
             IconButton::new("selected_with_tooltip_button", IconName::InlayHint)
-                .selected(true)
+                .toggle_state(true)
                 .tooltip(|cx| Tooltip::text("Toggle inlay hints", cx)),
         )
         .description("Displays a selected icon button with tooltip.")
@@ -111,38 +111,36 @@ impl Render for IconButtonStory {
             selected_with_tooltip_button,
         ];
 
-        StoryContainer::new(
-            "Icon Button",
-            "crates/ui/src/components/stories/icon_button.rs",
-        )
-        .child(StorySection::new().children(buttons))
-        .child(
-            StorySection::new().child(StoryItem::new(
-                "Square",
-                h_flex()
-                    .gap_2()
-                    .child(
-                        IconButton::new("square-medium", IconName::Close)
-                            .shape(IconButtonShape::Square)
-                            .icon_size(IconSize::Medium),
-                    )
-                    .child(
-                        IconButton::new("square-small", IconName::Close)
-                            .shape(IconButtonShape::Square)
-                            .icon_size(IconSize::Small),
-                    )
-                    .child(
-                        IconButton::new("square-xsmall", IconName::Close)
-                            .shape(IconButtonShape::Square)
-                            .icon_size(IconSize::XSmall),
-                    )
-                    .child(
-                        IconButton::new("square-indicator", IconName::Close)
-                            .shape(IconButtonShape::Square)
-                            .icon_size(IconSize::Indicator),
-                    ),
-            )),
-        )
-        .into_element()
+        Story::container()
+            .child(Story::title_for::<IconButton>())
+            .child(StorySection::new().children(buttons))
+            .child(
+                StorySection::new().child(StoryItem::new(
+                    "Square",
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            IconButton::new("square-medium", IconName::Close)
+                                .shape(IconButtonShape::Square)
+                                .icon_size(IconSize::Medium),
+                        )
+                        .child(
+                            IconButton::new("square-small", IconName::Close)
+                                .shape(IconButtonShape::Square)
+                                .icon_size(IconSize::Small),
+                        )
+                        .child(
+                            IconButton::new("square-xsmall", IconName::Close)
+                                .shape(IconButtonShape::Square)
+                                .icon_size(IconSize::XSmall),
+                        )
+                        .child(
+                            IconButton::new("square-indicator", IconName::Close)
+                                .shape(IconButtonShape::Square)
+                                .icon_size(IconSize::Indicator),
+                        ),
+                )),
+            )
+            .into_element()
     }
 }

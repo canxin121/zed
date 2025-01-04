@@ -1,5 +1,5 @@
 use anyhow::Result;
-use call::report_call_event_for_channel;
+use call::ActiveCall;
 use channel::{Channel, ChannelBuffer, ChannelBufferEvent, ChannelStore};
 use client::{
     proto::{self, PeerId},
@@ -66,11 +66,13 @@ impl ChannelView {
         cx.spawn(|mut cx| async move {
             let channel_view = channel_view.await?;
             pane.update(&mut cx, |pane, cx| {
-                report_call_event_for_channel(
-                    "open channel notes",
+                telemetry::event!(
+                    "Channel Notes Opened",
                     channel_id,
-                    &workspace.read(cx).app_state().client,
-                    cx,
+                    room_id = ActiveCall::global(cx)
+                        .read(cx)
+                        .room()
+                        .map(|r| r.read(cx).id())
                 );
                 pane.add_item(Box::new(channel_view.clone()), true, true, None, cx);
             })?;
@@ -227,7 +229,7 @@ impl ChannelView {
             {
                 self.editor.update(cx, |editor, cx| {
                     editor.change_selections(Some(Autoscroll::focused()), cx, |s| {
-                        s.replace_cursors_with(|map| vec![item.range.start.to_display_point(&map)])
+                        s.replace_cursors_with(|map| vec![item.range.start.to_display_point(map)])
                     })
                 });
                 return;
@@ -280,7 +282,7 @@ impl ChannelView {
         };
 
         let link = channel.notes_link(closest_heading.map(|heading| heading.text), cx);
-        cx.write_to_clipboard(ClipboardItem::new(link));
+        cx.write_to_clipboard(ClipboardItem::new_string(link));
         self.workspace
             .update(cx, |workspace, cx| {
                 struct CopyLinkForPositionToast;
@@ -460,8 +462,7 @@ impl Item for ChannelView {
     }
 
     fn deactivated(&mut self, cx: &mut ViewContext<Self>) {
-        self.editor
-            .update(cx, |editor, cx| Item::deactivated(editor, cx))
+        self.editor.update(cx, Item::deactivated)
     }
 
     fn set_nav_history(&mut self, history: ItemNavHistory, cx: &mut ViewContext<Self>) {

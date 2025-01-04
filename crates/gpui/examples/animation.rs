@@ -1,6 +1,11 @@
 use std::time::Duration;
 
-use gpui::*;
+use anyhow::Result;
+use gpui::{
+    black, bounce, div, ease_in_out, percentage, prelude::*, px, rgb, size, svg, Animation,
+    AnimationExt as _, App, AppContext, AssetSource, Bounds, SharedString, Transformation,
+    ViewContext, WindowBounds, WindowOptions,
+};
 
 struct Assets {}
 
@@ -9,7 +14,7 @@ impl AssetSource for Assets {
         std::fs::read(path)
             .map(Into::into)
             .map_err(Into::into)
-            .map(|result| Some(result))
+            .map(Some)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
@@ -23,7 +28,7 @@ impl AssetSource for Assets {
     }
 }
 
-const ARROW_CIRCLE_SVG: &'static str = concat!(
+const ARROW_CIRCLE_SVG: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/examples/image/arrow_circle.svg"
 );
@@ -37,7 +42,7 @@ impl Render for AnimationExample {
                 div()
                     .flex()
                     .bg(rgb(0x2e7d32))
-                    .size(Length::Definite(Pixels(300.0).into()))
+                    .size(px(300.0))
                     .justify_center()
                     .items_center()
                     .shadow_lg()

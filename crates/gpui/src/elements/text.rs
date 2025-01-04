@@ -1,8 +1,8 @@
 use crate::{
     ActiveTooltip, AnyTooltip, AnyView, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, SharedString, Size, TextRun, TextStyle, WhiteSpace, WindowContext, WrappedLine,
-    TOOLTIP_DELAY,
+    Pixels, Point, SharedString, Size, TextRun, TextStyle, Truncate, WhiteSpace, WindowContext,
+    WrappedLine, TOOLTIP_DELAY,
 };
 use anyhow::anyhow;
 use parking_lot::{Mutex, MutexGuard};
@@ -244,13 +244,15 @@ struct TextLayoutInner {
     bounds: Option<Bounds<Pixels>>,
 }
 
+const ELLIPSIS: &str = "…";
+
 impl TextLayout {
     fn lock(&self) -> MutexGuard<Option<TextLayoutInner>> {
         self.0.lock()
     }
 
     fn layout(
-        &mut self,
+        &self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
         cx: &mut WindowContext,
@@ -261,7 +263,7 @@ impl TextLayout {
             .line_height
             .to_pixels(font_size.into(), cx.rem_size());
 
-        let runs = if let Some(runs) = runs {
+        let mut runs = if let Some(runs) = runs {
             runs
         } else {
             vec![text_style.to_run(text.len())]
@@ -280,6 +282,20 @@ impl TextLayout {
                     None
                 };
 
+                let (truncate_width, ellipsis) = if let Some(truncate) = text_style.truncate {
+                    let width = known_dimensions.width.or(match available_space.width {
+                        crate::AvailableSpace::Definite(x) => Some(x),
+                        _ => None,
+                    });
+
+                    match truncate {
+                        Truncate::Truncate => (width, None),
+                        Truncate::Ellipsis => (width, Some(ELLIPSIS)),
+                    }
+                } else {
+                    (None, None)
+                };
+
                 if let Some(text_layout) = element_state.0.lock().as_ref() {
                     if text_layout.size.is_some()
                         && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
@@ -288,13 +304,17 @@ impl TextLayout {
                     }
                 }
 
+                let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
+                let text = if let Some(truncate_width) = truncate_width {
+                    line_wrapper.truncate_line(text.clone(), truncate_width, ellipsis, &mut runs)
+                } else {
+                    text.clone()
+                };
+
                 let Some(lines) = cx
                     .text_system()
                     .shape_text(
-                        text.clone(),
-                        font_size,
-                        &runs,
-                        wrap_width, // Wrap if we know the width.
+                        text, font_size, &runs, wrap_width, // Wrap if we know the width.
                     )
                     .log_err()
                 else {
@@ -330,7 +350,7 @@ impl TextLayout {
         layout_id
     }
 
-    fn prepaint(&mut self, bounds: Bounds<Pixels>, text: &str) {
+    fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
         let mut element_state = self.lock();
         let element_state = element_state
             .as_mut()
@@ -339,7 +359,7 @@ impl TextLayout {
         element_state.bounds = Some(bounds);
     }
 
-    fn paint(&mut self, text: &str, cx: &mut WindowContext) {
+    fn paint(&self, text: &str, cx: &mut WindowContext) {
         let element_state = self.lock();
         let element_state = element_state
             .as_ref()
@@ -452,9 +472,9 @@ pub struct InteractiveText {
     element_id: ElementId,
     text: StyledText,
     click_listener:
-        Option<Box<dyn Fn(&[Range<usize>], InteractiveTextClickEvent, &mut WindowContext<'_>)>>,
-    hover_listener: Option<Box<dyn Fn(Option<usize>, MouseMoveEvent, &mut WindowContext<'_>)>>,
-    tooltip_builder: Option<Rc<dyn Fn(usize, &mut WindowContext<'_>) -> Option<AnyView>>>,
+        Option<Box<dyn Fn(&[Range<usize>], InteractiveTextClickEvent, &mut WindowContext)>>,
+    hover_listener: Option<Box<dyn Fn(Option<usize>, MouseMoveEvent, &mut WindowContext)>>,
+    tooltip_builder: Option<Rc<dyn Fn(usize, &mut WindowContext) -> Option<AnyView>>>,
     clickable_ranges: Vec<Range<usize>>,
 }
 
@@ -490,7 +510,7 @@ impl InteractiveText {
     pub fn on_click(
         mut self,
         ranges: Vec<Range<usize>>,
-        listener: impl Fn(usize, &mut WindowContext<'_>) + 'static,
+        listener: impl Fn(usize, &mut WindowContext) + 'static,
     ) -> Self {
         self.click_listener = Some(Box::new(move |ranges, event, cx| {
             for (range_ix, range) in ranges.iter().enumerate() {
@@ -508,7 +528,7 @@ impl InteractiveText {
     /// index of the hovered character, or None if the mouse leaves the text.
     pub fn on_hover(
         mut self,
-        listener: impl Fn(Option<usize>, MouseMoveEvent, &mut WindowContext<'_>) + 'static,
+        listener: impl Fn(Option<usize>, MouseMoveEvent, &mut WindowContext) + 'static,
     ) -> Self {
         self.hover_listener = Some(Box::new(listener));
         self
@@ -517,7 +537,7 @@ impl InteractiveText {
     /// tooltip lets you specify a tooltip for a given character index in the string.
     pub fn tooltip(
         mut self,
-        builder: impl Fn(usize, &mut WindowContext<'_>) -> Option<AnyView> + 'static,
+        builder: impl Fn(usize, &mut WindowContext) -> Option<AnyView> + 'static,
     ) -> Self {
         self.tooltip_builder = Some(Rc::new(builder));
         self
@@ -584,7 +604,7 @@ impl Element for InteractiveText {
                 let mut interactive_state = interactive_state.unwrap_or_default();
                 if let Some(click_listener) = self.click_listener.take() {
                     let mouse_position = cx.mouse_position();
-                    if let Some(ix) = text_layout.index_for_position(mouse_position).ok() {
+                    if let Ok(ix) = text_layout.index_for_position(mouse_position) {
                         if self
                             .clickable_ranges
                             .iter()
@@ -601,8 +621,8 @@ impl Element for InteractiveText {
                         let clickable_ranges = mem::take(&mut self.clickable_ranges);
                         cx.on_mouse_event(move |event: &MouseUpEvent, phase, cx| {
                             if phase == DispatchPhase::Bubble && hitbox.is_hovered(cx) {
-                                if let Some(mouse_up_index) =
-                                    text_layout.index_for_position(event.position).ok()
+                                if let Ok(mouse_up_index) =
+                                    text_layout.index_for_position(event.position)
                                 {
                                     click_listener(
                                         &clickable_ranges,
@@ -622,8 +642,8 @@ impl Element for InteractiveText {
                         let hitbox = hitbox.clone();
                         cx.on_mouse_event(move |event: &MouseDownEvent, phase, cx| {
                             if phase == DispatchPhase::Bubble && hitbox.is_hovered(cx) {
-                                if let Some(mouse_down_index) =
-                                    text_layout.index_for_position(event.position).ok()
+                                if let Ok(mouse_down_index) =
+                                    text_layout.index_for_position(event.position)
                                 {
                                     mouse_down.set(Some(mouse_down_index));
                                     cx.refresh();
@@ -655,6 +675,7 @@ impl Element for InteractiveText {
 
                 if let Some(tooltip_builder) = self.tooltip_builder.clone() {
                     let hitbox = hitbox.clone();
+                    let source_bounds = hitbox.bounds;
                     let active_tooltip = interactive_state.active_tooltip.clone();
                     let pending_mouse_down = interactive_state.mouse_down_index.clone();
                     let text_layout = text_layout.clone();
@@ -688,6 +709,8 @@ impl Element for InteractiveText {
                                                     tooltip: Some(AnyTooltip {
                                                         view: tooltip,
                                                         mouse_position: cx.mouse_position(),
+                                                        hoverable: true,
+                                                        origin_bounds: source_bounds,
                                                     }),
                                                     _task: None,
                                                 }

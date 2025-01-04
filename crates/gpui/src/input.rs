@@ -1,4 +1,4 @@
-use crate::{Bounds, InputHandler, Pixels, View, ViewContext, WindowContext};
+use crate::{Bounds, InputHandler, Pixels, UTF16Selection, View, ViewContext, WindowContext};
 use std::ops::Range;
 
 /// Implement this trait to allow views to handle textual input when implementing an editor, field, etc.
@@ -9,11 +9,19 @@ use std::ops::Range;
 /// See [`InputHandler`] for details on how to implement each method.
 pub trait ViewInputHandler: 'static + Sized {
     /// See [`InputHandler::text_for_range`] for details
-    fn text_for_range(&mut self, range: Range<usize>, cx: &mut ViewContext<Self>)
-        -> Option<String>;
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        cx: &mut ViewContext<Self>,
+    ) -> Option<String>;
 
     /// See [`InputHandler::selected_text_range`] for details
-    fn selected_text_range(&mut self, cx: &mut ViewContext<Self>) -> Option<Range<usize>>;
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled_input: bool,
+        cx: &mut ViewContext<Self>,
+    ) -> Option<UTF16Selection>;
 
     /// See [`InputHandler::marked_text_range`] for details
     fn marked_text_range(&self, cx: &mut ViewContext<Self>) -> Option<Range<usize>>;
@@ -68,9 +76,14 @@ impl<V: 'static> ElementInputHandler<V> {
 }
 
 impl<V: ViewInputHandler> InputHandler for ElementInputHandler<V> {
-    fn selected_text_range(&mut self, cx: &mut WindowContext) -> Option<Range<usize>> {
-        self.view
-            .update(cx, |view, cx| view.selected_text_range(cx))
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled_input: bool,
+        cx: &mut WindowContext,
+    ) -> Option<UTF16Selection> {
+        self.view.update(cx, |view, cx| {
+            view.selected_text_range(ignore_disabled_input, cx)
+        })
     }
 
     fn marked_text_range(&mut self, cx: &mut WindowContext) -> Option<Range<usize>> {
@@ -80,10 +93,12 @@ impl<V: ViewInputHandler> InputHandler for ElementInputHandler<V> {
     fn text_for_range(
         &mut self,
         range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
         cx: &mut WindowContext,
     ) -> Option<String> {
-        self.view
-            .update(cx, |view, cx| view.text_for_range(range_utf16, cx))
+        self.view.update(cx, |view, cx| {
+            view.text_for_range(range_utf16, adjusted_range, cx)
+        })
     }
 
     fn replace_text_in_range(

@@ -166,6 +166,7 @@ pub async fn parse_markdown_block(
     let mut list_stack = Vec::new();
 
     let mut options = pulldown_cmark::Options::all();
+    options.remove(pulldown_cmark::Options::ENABLE_DEFINITION_LIST);
     options.remove(pulldown_cmark::Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
 
     for event in Parser::new_ext(markdown, options) {
@@ -191,7 +192,7 @@ pub async fn parse_markdown_block(
                         style.strikethrough = true;
                     }
 
-                    if let Some(link) = link_url.clone().and_then(|u| Link::identify(u)) {
+                    if let Some(link) = link_url.clone().and_then(Link::identify) {
                         region_ranges.push(prev_len..text.len());
                         regions.push(ParsedRegion {
                             code: false,
@@ -222,7 +223,7 @@ pub async fn parse_markdown_block(
                 text.push_str(t.as_ref());
                 region_ranges.push(prev_len..text.len());
 
-                let link = link_url.clone().and_then(|u| Link::identify(u));
+                let link = link_url.clone().and_then(Link::identify);
                 if link.is_some() {
                     highlights.push((
                         prev_len..text.len(),
@@ -238,12 +239,7 @@ pub async fn parse_markdown_block(
             Event::Start(tag) => match tag {
                 Tag::Paragraph => new_paragraph(text, &mut list_stack),
 
-                Tag::Heading {
-                    level: _,
-                    id: _,
-                    classes: _,
-                    attrs: _,
-                } => {
+                Tag::Heading { .. } => {
                     new_paragraph(text, &mut list_stack);
                     bold_depth += 1;
                 }
@@ -266,12 +262,7 @@ pub async fn parse_markdown_block(
 
                 Tag::Strikethrough => strikethrough_depth += 1,
 
-                Tag::Link {
-                    link_type: _,
-                    dest_url,
-                    title: _,
-                    id: _,
-                } => link_url = Some(dest_url.to_string()),
+                Tag::Link { dest_url, .. } => link_url = Some(dest_url.to_string()),
 
                 Tag::List(number) => {
                     list_stack.push((number, false));
@@ -336,7 +327,7 @@ pub fn highlight_code(
 }
 
 /// Appends a new paragraph to the provided `text` buffer.
-pub fn new_paragraph(text: &mut String, list_stack: &mut Vec<(Option<u64>, bool)>) {
+pub fn new_paragraph(text: &mut String, list_stack: &mut [(Option<u64>, bool)]) {
     let mut is_subsequent_paragraph_of_list = false;
     if let Some((_, has_content)) = list_stack.last_mut() {
         if *has_content {
@@ -384,6 +375,7 @@ public: void format(const int &, const std::tm &, int &dest)
 "#;
 
         let mut options = pulldown_cmark::Options::all();
+        options.remove(pulldown_cmark::Options::ENABLE_DEFINITION_LIST);
         options.remove(pulldown_cmark::Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
 
         let parser = pulldown_cmark::Parser::new_ext(input, options);

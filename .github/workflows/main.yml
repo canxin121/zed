@@ -11,6 +11,9 @@ jobs:
       - name: git modules
         run: git submodule update --init --recursive
         
+      - name: path limit
+        run: git config --system core.longpaths true
+        
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         
